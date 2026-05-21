@@ -1,5 +1,6 @@
 #pragma once
 
+#include "xtensor/core/xoperation.hpp"
 #include <cstdint>
 #include <xtensor/core/xtensor_forward.hpp>
 #include <nanobind/nanobind.h>
@@ -19,7 +20,9 @@ int8_t get_lsb_loc(float x);
 xt::xarray<int8_t> _volatile_int_arr_to_csd(xt::xarray<int32_t> &x);
 
 template <typename T> inline auto _shift_amount(T &x, int32_t axis) {
-    return xt::amin(xt::vectorize(get_lsb_loc)(x), axis);
+    T ret = xt::amin(xt::vectorize(get_lsb_loc)(x), axis);
+    ret = xt::where(xt::equal(ret, 127), 0, ret); // 127->all zeros on that ax
+    return ret;
 }
 
 template <typename T> auto _center(T &arr) {
