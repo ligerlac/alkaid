@@ -26,10 +26,12 @@ using namespace nb::literals;
 template <class F> static void dispatch_batch_B(int batch_B, F &&f) {
     if (batch_B == 16)
         f(std::integral_constant<int, 16>{});
+    else if (batch_B == 8)
+        f(std::integral_constant<int, 8>{});
     else if (batch_B == 4)
         f(std::integral_constant<int, 4>{});
     else
-        f(std::integral_constant<int, 8>{});
+        f(std::integral_constant<int, 1>{});
 }
 
 static void _run_predict(
@@ -171,7 +173,7 @@ static size_t probe_l3_cache() {
 }
 
 // Pick (B, n_threads) from the probed cache sizes. B is the largest of
-// {16, 8, 4} whose per-thread buffer fits 80% of L2; defaults to 8 when
+// {16, 8, 4, 1} whose per-thread buffer fits 80% of L2; defaults to 8 when
 // unknown. n_threads is capped so the aggregate fits 80% of L3. Override
 // via ALIR_BATCH_B / ALIR_NUM_THREADS.
 struct AutoConfig {
@@ -183,11 +185,11 @@ static AutoConfig pick_auto_config(size_t n_samples, size_t n_slots, int64_t req
     const size_t l3 = probe_l3_cache();
     const size_t slot_bytes = n_slots * sizeof(int64_t);
 
-    int B = 8;
+    int B = n_samples >= 4 ? 4 : 1;
     if (l2 > 0 && slot_bytes > 0) {
         const size_t budget = l2 * 8 / 10;
-        for (int candidate : {16, 8, 4}) {
-            if ((size_t)candidate * slot_bytes <= budget) {
+        for (int candidate : {16, 8, 4, 1}) {
+            if ((size_t)candidate * slot_bytes <= budget && candidate <= n_samples) {
                 B = candidate;
                 break;
             }
@@ -233,7 +235,7 @@ static void run_interp_loaded(
     const char *b_env = std::getenv("ALIR_BATCH_B");
     if (b_env) {
         int bv = std::atoi(b_env);
-        if (bv == 4 || bv == 8 || bv == 16)
+        if (bv == 1 || bv == 4 || bv == 8 || bv == 16)
             cfg.B = bv;
     }
     const char *t_env = std::getenv("ALIR_NUM_THREADS");
@@ -281,7 +283,8 @@ static nb::ndarray<nb::numpy, double> run_interp_numpy(
     const nb::bytes &bin_logic,
     const nb::ndarray<nb::numpy, double> &input,
     int64_t n_threads,
-    bool dump
+    bool dump,
+    bool ignore_lookup_oob
 ) {
     const uint8_t *bin_logic_ptr = reinterpret_cast<const uint8_t *>(bin_logic.data());
     if (bin_logic.size() < 24)
@@ -289,6 +292,7 @@ static nb::ndarray<nb::numpy, double> run_interp_numpy(
 
     alir::ALIRInterpreter interp;
     interp.load_from_bytecode(std::span<const uint8_t>(bin_logic_ptr, bin_logic.size()));
+    interp.ignore_oob_lookup = ignore_lookup_oob;
 
     const size_t n_samples = input.size() / interp.get_n_in();
     const size_t n_out = dump ? interp.get_n_ops() : interp.get_n_out();
@@ -307,7 +311,8 @@ static nb::ndarray<nb::numpy, double> run_interp_json_numpy(
     const std::string &json_text,
     const nb::ndarray<nb::numpy, double> &input,
     int64_t n_threads,
-    bool dump
+    bool dump,
+    bool ignore_lookup_oob
 ) {
     alir::ALIRInterpreter interp;
     interp.load_from_json_string(json_text);
@@ -329,7 +334,8 @@ static nb::ndarray<nb::numpy, double> run_interp_json_file_numpy(
     const std::string &path,
     const nb::ndarray<nb::numpy, double> &input,
     int64_t n_threads,
-    bool dump
+    bool dump,
+    bool ignore_lookup_oob
 ) {
     alir::ALIRInterpreter interp;
     interp.load_from_json_file(path);
@@ -348,9 +354,23 @@ static nb::ndarray<nb::numpy, double> run_interp_json_file_numpy(
 }
 
 NB_MODULE(alir_bin, m) {
-    m.def("run_interp", &run_interp_numpy, "bin_logic"_a, "data"_a, "n_threads"_a = 1, "dump"_a = false);
     m.def(
-        "run_interp_json", &run_interp_json_numpy, "json_text"_a, "data"_a, "n_threads"_a = 1, "dump"_a = false
+        "run_interp",
+        &run_interp_numpy,
+        "bin_logic"_a,
+        "data"_a,
+        "n_threads"_a = 1,
+        "dump"_a = false,
+        "ignore_lookup_oob"_a = false
+    );
+    m.def(
+        "run_interp_json",
+        &run_interp_json_numpy,
+        "json_text"_a,
+        "data"_a,
+        "n_threads"_a = 1,
+        "dump"_a = false,
+        "ignore_lookup_oob"_a = false
     );
     m.def(
         "run_interp_json_file",
@@ -358,6 +378,7 @@ NB_MODULE(alir_bin, m) {
         "path"_a,
         "data"_a,
         "n_threads"_a = 1,
-        "dump"_a = false
+        "dump"_a = false,
+        "ignore_lookup_oob"_a = false
     );
 }

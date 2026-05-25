@@ -6,7 +6,8 @@ import pytest
 
 from alkaid._binary import alir_interp_run_json_file
 from alkaid.codegen import HLSModel, RTLModel
-from alkaid.trace import FVArray, trace
+from alkaid.stateful import pipeline_to_fsm
+from alkaid.trace import FVArray, to_pipeline, trace
 from alkaid.trace.ops import quantize, relu
 from alkaid.trace.passes import dead_code_elimin, fuse_ternary_adders, optimize
 from alkaid.types import CombLogic
@@ -85,6 +86,15 @@ class OperationTest:
 
         np.testing.assert_equal(pred, pred2)
         np.testing.assert_equal(pred, pred3)
+
+    @pytest.mark.parametrize('n_stages', [1, 3])
+    def test_fsm_pred(self, comb: CombLogic, test_data: np.ndarray, n_stages: int):
+
+        pipe = to_pipeline(comb, n_stages=n_stages)
+        fsm = pipeline_to_fsm(pipe)
+        fsm_pred = fsm.predict(test_data[:1000])['model_out']
+        comb_pred = comb.predict(test_data[:1000])
+        np.testing.assert_equal(comb_pred, fsm_pred)
 
 
 class OperationTestSynth(OperationTest):

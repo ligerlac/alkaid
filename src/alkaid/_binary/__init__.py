@@ -17,7 +17,7 @@ from .cmvm_bin import (
 )
 
 
-def alir_interp_run(bin_logic: bytes, data: NDArray, n_threads: int = 1, dump: bool = False):
+def alir_interp_run(bin_logic: bytes, data: NDArray, n_threads: int = 1, dump: bool = False, ignore_lookup_oob: bool = False):
     from .alir_bin import run_interp
 
     if len(bin_logic) < 24:
@@ -28,14 +28,14 @@ def alir_interp_run(bin_logic: bytes, data: NDArray, n_threads: int = 1, dump: b
     assert data.size % inp_size == 0, f'Input size {data.size} is not divisible by {inp_size}'
 
     inputs = np.ascontiguousarray(np.ravel(data), dtype=np.float64)
-    return run_interp(bin_logic, inputs, n_threads, dump=dump)
+    return run_interp(bin_logic, inputs, n_threads, dump=dump, ignore_lookup_oob=ignore_lookup_oob)
 
 
-def alir_interp_run_json_file(path: str, data: NDArray, n_threads: int = 1, dump: bool = False):
+def alir_interp_run_json_file(path: str, data: NDArray, n_threads: int = 1, dump: bool = False, ignore_lookup_oob: bool = False):
     from .alir_bin import run_interp_json_file
 
     inputs = np.ascontiguousarray(np.ravel(data), dtype=np.float64)
-    return run_interp_json_file(path, inputs, n_threads, dump=dump)
+    return run_interp_json_file(path, inputs, n_threads, dump=dump, ignore_lookup_oob=ignore_lookup_oob)
 
 
 __all__ = [

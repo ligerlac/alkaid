@@ -577,7 +577,14 @@ class CombLogic(NamedTuple):
 
         return bytes(data)
 
-    def predict(self, data: NDArray | Sequence[NDArray], n_threads: int = 0, debug=False, dump=False) -> NDArray[np.float64]:
+    def predict(
+        self,
+        data: NDArray | Sequence[NDArray],
+        n_threads: int = 0,
+        debug=False,
+        dump=False,
+        ignore_lookup_oob: bool = False,
+    ) -> NDArray[np.float64]:
         """Predict a batch with the C++ ALIR interpreter.
 
         Cannot be used if the binary interpreter is not installed.
@@ -594,6 +601,9 @@ class CombLogic(NamedTuple):
             If OpenMP is not supported, this parameter is ignored.
         debug: bool
             If True, the function will print debug information about the operations being performed.
+        ignore_lookup_oob: bool
+            If True, the function will ignore out-of-bounds accesses in lookup operations and return
+            random values instead on those entries.
 
         Returns
         -------
@@ -606,7 +616,7 @@ class CombLogic(NamedTuple):
         if n_threads <= 0:
             n_threads = int(os.environ.get('DA_DEFAULT_THREADS', 0))
         bin_logic = self.to_bytecode()
-        return alir_interp_run(bin_logic, data, n_threads, dump=dump)
+        return alir_interp_run(bin_logic, data, n_threads, dump=dump, ignore_lookup_oob=ignore_lookup_oob)
 
 
 class Pipeline(NamedTuple):

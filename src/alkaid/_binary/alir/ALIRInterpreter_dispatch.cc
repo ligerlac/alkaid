@@ -133,7 +133,7 @@ namespace alir {
                     table.data(),
                     (int64_t)table.size(),
                     off,
-                    allow_oob_lookup
+                    ignore_oob_lookup
                 );
                 break;
             }
@@ -226,11 +226,12 @@ namespace alir {
         }
     }
 
-    // Explicit instantiations — B choices picked by bindings.cc via
-    // pick_auto_config.
+    // Explicit instantiations — B choices picked by bindings.cc via pick_auto_config.
+    template void ALIRInterpreter::exec_batch<1>(const double *, double *, size_t, int64_t *) const;
     template void ALIRInterpreter::exec_batch<4>(const double *, double *, size_t, int64_t *) const;
     template void ALIRInterpreter::exec_batch<8>(const double *, double *, size_t, int64_t *) const;
     template void ALIRInterpreter::exec_batch<16>(const double *, double *, size_t, int64_t *) const;
+    template void ALIRInterpreter::dump_batch<1>(const double *, double *, size_t, int64_t *) const;
     template void ALIRInterpreter::dump_batch<4>(const double *, double *, size_t, int64_t *) const;
     template void ALIRInterpreter::dump_batch<8>(const double *, double *, size_t, int64_t *) const;
     template void ALIRInterpreter::dump_batch<16>(const double *, double *, size_t, int64_t *) const;

@@ -4,7 +4,7 @@ from .fsm import FSM, AddrMap, Dir, ModuloSchedule, NamedLogic, NamedPort
 
 def pipeline_to_fsm(pipe: Pipeline) -> FSM:
     lat = len(pipe.solutions)
-    assert lat > 1, 'Pipeline must not be empty'
+    assert lat > 0, 'Pipeline must not be empty'
 
     logics = tuple(NamedLogic(f'logic{i}', sol) for i, sol in enumerate(pipe.solutions))
 
@@ -24,9 +24,13 @@ def pipeline_to_fsm(pipe: Pipeline) -> FSM:
     addr_maps: list[AddrMap] = []
     for i in range(lat):
         n_in, n_out = pipe.solutions[i].shape
-        addr_map_in = AddrMap(ports[i].name, (0, n_in), logics[i].name, (0, n_in))
+        if n_out == 0:
+            continue
+        if n_in > 0:
+            addr_map_in = AddrMap(ports[i].name, (0, n_in), logics[i].name, (0, n_in))
+            addr_maps.append(addr_map_in)
         addr_map_out = AddrMap(logics[i].name, (0, n_out), ports[i + 1].name, (0, n_out))
-        addr_maps.append(addr_map_in)
         addr_maps.append(addr_map_out)
+    logics = tuple(logic for logic in logics if logic.logic.shape[1] > 0)
 
     return FSM(logics, tuple(ports), tuple(addr_maps))

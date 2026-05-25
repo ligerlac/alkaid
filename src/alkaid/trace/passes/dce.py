@@ -30,7 +30,7 @@ def remap_table_idxs(ops: list[Op], tables: tuple[LookupTable, ...] | None):
         new_table_idx = remap_index[table_idx]
         new_ops[i] = Op(op.addr, op.opcode, (new_table_idx,), op.qint, op.latency, op.cost)
 
-    return new_ops, tuple(new_tables)
+    return new_ops, tuple(new_tables) if len(new_tables) > 0 else None
 
 
 def dead_code_elimin(comb: CombLogic, keep_dead_inputs=False) -> CombLogic:

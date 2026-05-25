@@ -333,6 +333,13 @@ class FSM:
         self._init_emulator()
         return self._emu.run(data, steps, scheduled, output_only)
 
+    def predict(
+        self,
+        data: dict[str, np.ndarray] | Sequence[np.ndarray] | Sequence[dict[str, np.ndarray]] | np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        self._init_emulator()
+        return self._emu.predict(data)
+
     @property
     def states(self) -> dict[str, np.ndarray]:
         assert self._has_emu, 'Emulator not initialized yet'
@@ -365,7 +372,11 @@ class FSMEmulator:
             self._logic_io[_map.dst][0][d] = self._port_buffers[_map.src][s]
 
         for name, (inp_arr, out_arr) in self._logic_io.items():
-            out_arr[:] = self.fsm.get_logic(name).predict(inp_arr)
+            comb = self.fsm.get_logic(name)
+            if comb.shape[0] == 0:
+                out_arr[:] = comb([], quantize=False)
+            else:
+                out_arr[:] = comb.predict(inp_arr, n_threads=1, ignore_lookup_oob=True)
 
         new_port_buffers = self._create_port_buffers(True)
         for _map in self.fsm.logic_to_port_map:
@@ -410,6 +421,7 @@ class FSMEmulator:
         steps: int | None = None,
         scheduled: bool = True,
         output_only: bool = True,
+        extra_steps: int = 0,
     ) -> dict[str, np.ndarray]:
 
         t0 = self._t
@@ -446,15 +458,15 @@ class FSMEmulator:
         results = dict[str, np.ndarray]()
         for port in self.fsm.out_ports:
             if scheduled:
-                n_outputs = port.schedule.n_valid_samples_between(t0, t0 + steps)  # type: ignore
+                n_outputs = port.schedule.n_valid_samples_between(t0, t0 + steps + extra_steps)  # type: ignore
             else:
-                n_outputs = steps
+                n_outputs = steps + extra_steps
             results[port.name] = np.empty((n_outputs, port.size), dtype=np.float64)
         if not output_only:
             for port in self.fsm.internal_ports:
-                results[port.name] = np.empty((steps, port.size), dtype=np.float64)
+                results[port.name] = np.empty((steps + extra_steps, port.size), dtype=np.float64)
 
-        for _ in range(steps):
+        for _ in range(steps + extra_steps):
             for port in self.fsm.inp_ports:
                 if scheduled:
                     if not port.schedule.check(self._t):  # type: ignore
@@ -462,7 +474,8 @@ class FSMEmulator:
                     idx = port.schedule.n_valid_samples_between(t0, self._t + 1) - 1  # type: ignore
                 else:
                     idx = self._t - t0
-                self._port_buffers[port.name][:] = datamap[port.name][idx]
+                if idx < len(datamap[port.name]):
+                    self._port_buffers[port.name][:] = datamap[port.name][idx]
 
             self.step()
 
@@ -483,4 +496,12 @@ class FSMEmulator:
         self,
         data: Mapping[str, np.ndarray] | Sequence[np.ndarray] | Sequence[Mapping[str, np.ndarray]] | np.ndarray,
     ) -> dict[str, np.ndarray]:
-        return self.run(data, steps=None, scheduled=True, output_only=True)
+        _period = set()
+        for port in self.fsm.inp_ports + self.fsm.out_ports:
+            assert port.schedule is not None, f'Port {port.name} does not have a schedule'
+            _period.add(port.schedule.period)
+        assert len(_period) == 1, 'All ports must have the same schedule period'
+        extra_steps = max(port.schedule.bias for port in self.fsm.out_ports)  # type: ignore
+
+        self.reset()
+        return self.run(data, extra_steps=extra_steps - 1, scheduled=True, output_only=True)
