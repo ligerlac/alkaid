@@ -1,16 +1,17 @@
 import gzip
 import json
 from collections.abc import Mapping, Sequence
+from copy import copy
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import cached_property
 from pathlib import Path
-from typing import NamedTuple
-from warnings import warn
+from typing import TypeVar
 
 import numpy as np
 
 from ..types import ALIR_SPEC_VERSION, CombLogic, JSONEncoder, Precision, QInterval, _quantize
+from .ordering import topo_check_and_sort
 
 
 class Dir(Enum):
@@ -72,28 +73,58 @@ class ModuloSchedule:
         return period_count * self.period + idx_in_period + self.bias
 
 
-@dataclass
-class NamedPort:
-    name: str
-    dir: Dir
-    precisions: tuple[Precision, ...]
-    rst_to: tuple[float, ...] | None = None
-    schedule: ModuloSchedule | None = None
-    need_rst: bool = True
+class Signal:
+    def __init__(
+        self,
+        name: str,
+        exposed: bool,
+        precisions: tuple[Precision, ...],
+        rst_if: 'Signal | None' = None,
+        rst_to: tuple[float, ...] | tuple[int, ...] | None = None,
+        reg: bool = True,
+        schedule: ModuloSchedule | None = None,
+        mode: str = '',
+        view_interval: tuple[int, int] | None = None,
+    ):
+        assert mode in ('', 'r', 'w', 'rw'), 'Mode must be one of "", "r", "w", "rw"'
+        if mode in ('r', 'w') and not exposed:
+            assert rst_to is not None
+        self._rst_to: tuple[float, ...] | None = None
+        if rst_to is not None:
+            assert len(rst_to) == len(precisions), 'Reset value length must match precision length'
+            self._rst_to = tuple(_quantize(x, *kif) for x, kif in zip(rst_to, precisions))
+        elif rst_if is not None:
+            self._rst_to = tuple(0.0 for _ in precisions)
+        self._precisions = tuple(Precision(*kif) for kif in precisions)
 
-    def __post_init__(self):
-        if self.rst_to is not None:
-            assert len(self.rst_to) == len(self.precisions), 'Reset value length must match precision length'
-            self.rst_to = tuple(_quantize(x, *kif) for x, kif in zip(self.rst_to, self.precisions))
-        self.precisions = tuple(Precision(*kif) for kif in self.precisions)
-        if self.need_rst and self.rst_to is None:
-            self.rst_to = tuple(0.0 for _ in self.precisions)
-        self.dir = Dir(self.dir)
-        if isinstance(self.schedule, list):
-            self.schedule = ModuloSchedule(*self.schedule)
+        self.name = name
+        self.exposed = exposed
+        self.rst_if = rst_if
+        self.reg = reg
+        self.schedule = schedule
+        self.mode = mode
+        self.view_interval = view_interval or (0, len(precisions))
+        self.schedule = ModuloSchedule(*schedule) if isinstance(schedule, Sequence) else schedule
+
+    def __len__(self):
+        return self.size
+
+    def read(self):
+        self.mode = 'r' + self.mode if 'r' not in self.mode else self.mode
+
+    def write(self):
+        self.mode = self.mode + 'w' if 'w' not in self.mode else self.mode
+
+    @property
+    def raw(self) -> 'Signal':
+        if len(self.view_interval) == (0, len(self._precisions)):
+            return self
+        r = copy(self)
+        r.view_interval = (0, len(self._precisions))
+        return r
 
     def __eq__(self, other: object) -> bool:
-        if not isinstance(other, NamedPort):
+        if not isinstance(other, Signal):
             return False
         return self.__dict__ == other.__dict__
 
@@ -108,213 +139,281 @@ class NamedPort:
     def to_dict(self) -> dict:
         return self.__dict__
 
+    def to_list(self) -> list:
+        """Serialize the full (un-sliced) signal to JSON-native types.
 
-class NamedLogic(NamedTuple):
-    name: str
-    logic: CombLogic
-
-    @classmethod
-    def from_list(cls, lst: list) -> 'NamedLogic':
-        assert len(lst) == 2, 'Invalid logic list'
-        name, logic_dict = lst
-        logic = CombLogic.from_dict(logic_dict, raw=True)
-        return cls(name, logic)
-
-
-class AddrMap(NamedTuple):
-    """Represent copying data from src[src_interval] to dst[dst_interval]
-    If src is a logic, it reads from its output; if dst is a logic, it writes to its input.
-    """
-
-    src: str
-    src_interval: tuple[int, int]
-    dst: str
-    dst_interval: tuple[int, int]
+        ``rst_if`` is stored by name; the reference is re-linked on load.
+        """
+        return [
+            self.name,
+            self.exposed,
+            [list(prec) for prec in self._precisions],
+            self.rst_if.name if self.rst_if is not None else None,
+            list(self._rst_to) if self._rst_to is not None else None,
+            self.reg,
+            self.schedule.to_list() if self.schedule is not None else None,
+            self.mode,
+        ]
 
     @classmethod
-    def from_list(cls, lst: list) -> 'AddrMap':
-        assert len(lst) == 4, 'Invalid addr map list'
-        src, src_interval, dst, dst_interval = lst
-        return cls(src, tuple(src_interval), dst, tuple(dst_interval))
-
-
-def _check_dir_and_bound(fsm: 'FSM'):
-    for addr_map in fsm.addr_maps:
-        src_obj = fsm.instances[addr_map.src]
-        dst_obj = fsm.instances[addr_map.dst]
-        src_int, dst_int = addr_map.src_interval, addr_map.dst_interval
-        if isinstance(src_obj, NamedLogic):
-            n_src = src_obj.logic.shape[1]
-        else:
-            n_src = src_obj.size
-            assert src_obj.dir in (Dir.IN, Dir.INTERNAL), f'Port {src_obj.name} cannot be read from'
-
-        if isinstance(dst_obj, NamedLogic):
-            n_dst = dst_obj.logic.shape[0]
-        else:
-            n_dst = dst_obj.size
-            assert dst_obj.dir in (Dir.OUT, Dir.INTERNAL), f'Port {dst_obj.name} cannot be written to'
-
-        assert 0 <= src_int[0] < src_int[1] <= n_src, f'Invalid src interval {src_int} for {src_obj.name}'
-        assert 0 <= dst_int[0] < dst_int[1] <= n_dst, f'Invalid dst interval {dst_int} for {dst_obj.name}'
-        assert src_int[1] - src_int[0] == dst_int[1] - dst_int[0], 'Src and dst intervals must have the same size'
-
-
-def _check_io(fsm: 'FSM'):
-    _buf_read_counts = {p.name: np.zeros(p.size, dtype=np.uint64) for p in fsm.ports}
-    _buf_write_counts = {p.name: np.zeros(p.size, dtype=np.uint64) for p in fsm.ports}
-    _logic_io_read_counts = {l.name: np.zeros(l.logic.shape[1], dtype=np.uint64) for l in fsm.logic}
-    _logic_io_write_counts = {l.name: np.zeros(l.logic.shape[0], dtype=np.uint64) for l in fsm.logic}
-
-    read_counts = {**_buf_read_counts, **_logic_io_read_counts}
-    write_counts = {**_buf_write_counts, **_logic_io_write_counts}
-
-    for addr_map in fsm.addr_maps:
-        src_obj = fsm.instances[addr_map.src]
-        dst_obj = fsm.instances[addr_map.dst]
-        read_counts[src_obj.name][addr_map.src_interval[0] : addr_map.src_interval[1]] += 1
-        write_counts[dst_obj.name][addr_map.dst_interval[0] : addr_map.dst_interval[1]] += 1
-        assert isinstance(src_obj, NamedPort) or isinstance(dst_obj, NamedPort), (
-            f'{addr_map.src} to {addr_map.dst} must involve at least one port'
+    def from_list(cls, lst: list) -> 'Signal':
+        name, exposed, precisions, _rst_if_name, rst_to, reg, schedule, mode = lst
+        return cls(
+            name,
+            exposed,
+            tuple(Precision(*prec) for prec in precisions),
+            rst_if=None,
+            rst_to=tuple(rst_to) if rst_to is not None else None,
+            reg=reg,
+            schedule=schedule,
+            mode=mode,
         )
 
-    for p in fsm.ports:
-        if p.dir in (Dir.OUT, Dir.INTERNAL):
-            write_count = write_counts[p.name]
-            assert np.all(write_count <= 1), f'Port {p.name} has elements written more than once'
-            if p.dir == Dir.INTERNAL:
-                read_count = read_counts[p.name]
-                assert np.all((read_count > 0) <= (write_count > 0)), (
-                    f'Non-inp port {p.name} has elements read without being written'
-                )
-                if np.any(read_count == 0):
-                    warn(f'Port {p.name} has unused elements')
+    def __getitem__(self, idx: int | slice) -> 'Signal':
+        if isinstance(idx, int):
+            idx = slice(idx, idx + 1)
+        assert idx.step is None or idx.step == 1, 'Step is not supported for Signal slicing'
+        r = copy(self)
+        r.view_interval = (self.view_interval[0] + idx.start, self.view_interval[0] + idx.stop)
+        return r
 
-    for logic in fsm.logic:
-        read_count = _logic_io_read_counts[logic.name]
-        write_count = _logic_io_write_counts[logic.name]
-        assert np.all(write_count <= 1), f'Logic {logic.name} has output elements written more than once'
-        # ignore collapsed io pins
-        write_count[np.sum(logic.logic.inp_kifs, axis=0) == 0] = 1
-        read_count[np.sum(logic.logic.out_kifs, axis=0) == 0] = 1
-        if not np.all(write_count == 1):
-            warn(f'Logic {logic.name} has input elements never written to')
-        if not np.all(read_count > 0):
-            warn(f'Logic {logic.name} has output elements never used')
+    @property
+    def bitwidths(self) -> tuple[int, ...]:
+        return tuple(sum(prec) for prec in self.precisions)
+
+    @property
+    def bits(self) -> int:
+        return sum(self.bitwidths)
+
+    @property
+    def precisions(self):
+        return self._precisions[self.view_interval[0] : self.view_interval[1]]
+
+    @property
+    def rst_to(self):
+        if self._rst_to is None:
+            return None
+        return self._rst_to[self.view_interval[0] : self.view_interval[1]]
+
+    def __repr__(self):
+        return f'Signal({self.name}[{self.view_interval[0]}:{self.view_interval[1]}])'
+
+
+@dataclass
+class Conn:
+    src: Signal
+    dst: Signal
+    enable_if: Signal | None = None
+    alt_src: Signal | None = None
+
+    def __post_init__(self):
+        if self.enable_if is not None:
+            assert self.enable_if.size == 1 and self.enable_if.precisions[0] == Precision(False, 1, 0), (
+                'Enable signal must be a single-bit boolean'
+            )
+
+        assert self.src.size == self.dst.size, 'Source and destination views must have the same width'
+
+        if self.alt_src is not None:
+            assert self.alt_src.size == self.dst.size, 'Alternative source view must match destination width'
+            assert self.src.reg == self.alt_src.reg, 'Source and alternative source must both be registers or both be wires'
+
+    @property
+    def clocked(self) -> bool:
+        return self.dst.reg
+
+    def to_dict(self) -> dict:
+        return {
+            'src': self.src.to_list(),
+            'dst': self.dst.to_list(),
+            'enable_if': self.enable_if.to_list() if self.enable_if is not None else None,
+            'alt_src': self.alt_src.to_list() if self.alt_src is not None else None,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'Conn':
+        return cls(
+            Signal.from_list(d['src']),
+            Signal.from_list(d['dst']),
+            Signal.from_list(d['enable_if']) if d['enable_if'] is not None else None,
+            Signal.from_list(d['alt_src']) if d['alt_src'] is not None else None,
+        )
+
+
+def _comb_io_signals(name: str, comb: CombLogic) -> tuple[Signal, Signal]:
+    prec_in = tuple(qint.kif for qint in comb.inp_qint)
+    prec_out = tuple(qint.kif for qint in comb.out_qint)
+    sig_in = Signal(f'~{name}:in', False, prec_in, reg=False)
+    sig_out = Signal(f'~{name}:out', False, prec_out, reg=False)
+    return sig_in, sig_out
+
+
+def _check_single_assignment(conns: Sequence[Conn]):
+    """Raise if two conns drive overlapping bits of the same signal."""
+    writes: dict[str, list[tuple[int, int, int]]] = {}
+    for i, conn in enumerate(conns):
+        lo, hi = conn.dst.view_interval
+        writes.setdefault(conn.dst.name, []).append((lo, hi, i))
+    for name, ws in writes.items():
+        ws.sort()
+        for (s0, e0, i0), (s1, e1, i1) in zip(ws, ws[1:]):
+            if e0 > s1:
+                raise ValueError(f'Double assignment on {name}[{max(s0, s1)}:{min(e0, e1)}] by conns #{i0} and #{i1}')
+
+
+class Buffer(np.ndarray):
+    def __new__(cls, sig: Signal, dtype=np.float64):
+        obj = super().__new__(cls, sig.size, dtype)
+        if sig.rst_to is not None:
+            obj[:] = sig.rst_to
+        obj._changed = False
+        return obj
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self._changed = True
+
+
+def _remove_const_logic(logic: dict[str, CombLogic], conns: Sequence[Conn]) -> tuple[dict[str, CombLogic], tuple[Conn, ...]]:
+
+    _logic, conns = copy(logic), copy(conns)
+    const_signals: dict[str, Signal] = {}
+    for name, comb in logic.items():
+        if comb.shape[0] != 0:
+            continue
+        rst_to = tuple(map(float, comb([], quantize=False)))
+        precisions = tuple(qint.kif for qint in comb.out_qint)
+        const_signals[f'~{name}:out'] = Signal(
+            f'~{name}:const',
+            exposed=False,
+            precisions=precisions,
+            rst_if=None,
+            rst_to=rst_to,
+            reg=True,
+            mode='r',
+        )
+        del _logic[name]
+
+    if not const_signals:
+        return logic, tuple(conns)
+    logic = _logic
+
+    T = TypeVar('T', Signal, None)
+
+    def remap_sig(sig: T) -> T:
+        if sig is None or sig.name not in const_signals:
+            return sig
+        const = const_signals[sig.name]
+        return const[sig.view_interval[0] : sig.view_interval[1]]
+
+    def remap_conn(conn: Conn):
+        return Conn(
+            remap_sig(conn.src),
+            conn.dst,
+            enable_if=remap_sig(conn.enable_if),  # type: ignore
+            alt_src=remap_sig(conn.alt_src),  # type: ignore
+        )
+
+    conns = tuple(remap_conn(conn) for conn in conns)
+    return logic, conns
 
 
 class FSM:
+    """Finite State Machine representation with combinational logic and register connections."""
+
     def __init__(
         self,
-        logic: tuple[NamedLogic, ...],
-        ports: tuple[NamedPort, ...],
-        addr_maps: tuple[AddrMap, ...],
+        logic: dict[str, CombLogic],
+        conns: tuple[Conn, ...],
+        _sorted=False,
     ):
-        self.logic = logic
-        self.ports = ports
-        self.addr_maps = addr_maps
+        self.logic = dict(logic)
+        conns = tuple(conns)
+        if not _sorted:
+            logic, conns = _remove_const_logic(self.logic, conns)
+
+        comb_conns = tuple(conn for conn in conns if not conn.clocked)
+        self.reg_conns = tuple(conn for conn in conns if conn.clocked)
+
+        self._set_signals(conns)
+
+        if not _sorted:
+            comb_conns = tuple(topo_check_and_sort(comb_conns))
+        self.comb_conns = comb_conns
+        _check_single_assignment(self.reg_conns)
+
         self._has_emu = False
 
-        _check_dir_and_bound(self)
-        _check_io(self)
+    @property
+    def inp_signals(self) -> tuple[Signal, ...]:
+        return tuple(sig for sig in self.signals.values() if sig.exposed and sig.mode == 'r')
 
-    def get_logic(self, name: str) -> CombLogic:
-        obj = self.instances[name]
-        assert isinstance(obj, NamedLogic), f'{name} is not a logic'
-        return obj.logic
+    @property
+    def out_signals(self) -> tuple[Signal, ...]:
+        return tuple(sig for sig in self.signals.values() if sig.exposed and 'w' in sig.mode)
 
-    def get_port(self, name: str) -> NamedPort:
-        obj = self.instances[name]
-        assert isinstance(obj, NamedPort), f'{name} is not a port'
-        return obj
+    @property
+    def internal_signals(self) -> tuple[Signal, ...]:
+        return tuple(sig for sig in self.signals.values() if not sig.exposed)
 
-    @cached_property
-    def instances(self) -> dict[str, NamedLogic | NamedPort]:
-        instances = dict[str, NamedLogic | NamedPort]()
-        for logic in self.logic:
-            assert logic.name not in instances, f'Duplicate name {logic.name}'
-            instances[logic.name] = logic
-        for port in self.ports:
-            assert port.name not in instances, f'Duplicate name {port.name}'
-            instances[port.name] = port
-        return instances
+    def _set_signals(self, conns: Sequence[Conn]):
+        signals: dict[str, Signal] = {}
 
-    @cached_property
-    def inp_ports(self) -> tuple[NamedPort, ...]:
-        return tuple(p for p in self.ports if p.dir == Dir.IN)
+        for conn in conns:
+            for sig in conn.src, conn.dst, conn.enable_if, conn.alt_src:
+                if sig is None or sig.name in signals:
+                    continue
+                signals[sig.name] = sig.raw
 
-    @cached_property
-    def out_ports(self) -> tuple[NamedPort, ...]:
-        return tuple(p for p in self.ports if p.dir == Dir.OUT)
+        for sig in list(signals.values()):
+            while sig.rst_if is not None and sig.rst_if.name not in signals:
+                sig = sig.rst_if
+                signals[sig.name] = sig.raw
 
-    @cached_property
-    def internal_ports(self) -> tuple[NamedPort, ...]:
-        return tuple(p for p in self.ports if p.dir == Dir.INTERNAL)
+        for name, comb in self.logic.items():
+            sig_in, sig_out = _comb_io_signals(name, comb)
+            signals[sig_in.name] = sig_in
+            signals[sig_out.name] = sig_out
 
-    @cached_property
-    def port_to_logic_map(self) -> tuple[AddrMap, ...]:
-        return tuple(
-            addr_map
-            for addr_map in self.addr_maps
-            if isinstance(self.instances[addr_map.src], NamedPort) and isinstance(self.instances[addr_map.dst], NamedLogic)
-        )
+        self.signals = signals
 
-    @cached_property
-    def logic_to_port_map(self) -> tuple[AddrMap, ...]:
-        return tuple(
-            addr_map
-            for addr_map in self.addr_maps
-            if isinstance(self.instances[addr_map.dst], NamedPort) and isinstance(self.instances[addr_map.src], NamedLogic)
-        )
+    @property
+    def wires(self) -> dict[str, Signal]:
+        return {name: sig for name, sig in self.signals.items() if not sig.reg}
 
-    @cached_property
-    def port_to_port_map(self) -> tuple[AddrMap, ...]:
-        return tuple(
-            addr_map
-            for addr_map in self.addr_maps
-            if isinstance(self.instances[addr_map.src], NamedPort) and isinstance(self.instances[addr_map.dst], NamedPort)
-        )
+    @property
+    def regs(self) -> dict[str, Signal]:
+        return {name: sig for name, sig in self.signals.items() if sig.reg}
 
-    def sinks_to(self, name: str) -> tuple[NamedLogic | NamedPort, ...]:
-        assert name in self.instances, f'No instance named {name}'
-        return tuple(self.instances[_map.dst] for _map in self.addr_maps if _map.src == name)
-
-    def sources_from(self, name: str) -> tuple[NamedLogic | NamedPort, ...]:
-        assert name in self.instances, f'No instance named {name}'
-        return tuple(self.instances[_map.src] for _map in self.addr_maps if _map.dst == name)
-
-    @classmethod
-    def from_dict(cls, d: dict, raw=False) -> 'FSM':
-        if not raw:
-            assert d['meta'] == 'ALIRFSM', 'Invalid FSM dict'
-            assert d['spec_version'] == ALIR_SPEC_VERSION, 'Unsupported FSM spec version'
-            d = d['fsm']
-
-        _logic = tuple(NamedLogic.from_list(l) for l in d['logic'])
-        _ports = tuple(NamedPort(**p) for p in d['ports'])
-        _addr_maps = tuple(AddrMap.from_list(m) for m in d['addr_maps'])
-        return cls(_logic, _ports, _addr_maps)
-
-    def dump_dict(self) -> dict:
+    def to_dict(self) -> dict:
         return {
             'meta': 'ALIRFSM',
             'spec_version': ALIR_SPEC_VERSION,
             'fsm': {
-                'logic': self.logic,
-                'ports': self.ports,
-                'addr_maps': self.addr_maps,
+                'logic': dict(self.logic),
+                'conns': self.comb_conns + self.reg_conns,
             },
         }
 
+    @classmethod
+    def from_dict(cls, d: dict, raw: bool = False) -> 'FSM':
+        if not raw:
+            assert d['meta'] == 'ALIRFSM', 'Not an ALIR FSM'
+            assert d['spec_version'] == ALIR_SPEC_VERSION, f'Unsupported ALIR spec version {d["spec_version"]}'
+            d = d['fsm']
+
+        logic = {name: CombLogic.from_dict(cl, raw=True) for name, cl in d['logic'].items()}
+        conns = tuple(Conn.from_dict(c) for c in d['conns'])
+        return cls(logic, conns, _sorted=True)
+
     def save(self, path: str | Path, compresslevel: int = 6):
-        dump = self.dump_dict()
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         if str(path).endswith('.gz'):
             with gzip.open(path, 'wt', encoding='utf-8', compresslevel=compresslevel) as f:
-                json.dump(dump, f, cls=JSONEncoder, separators=(',', ':'))
+                json.dump(self, f, cls=JSONEncoder, separators=(',', ':'))
         else:
             with open(path, 'w') as f:
-                json.dump(dump, f, cls=JSONEncoder, separators=(',', ':'))
+                json.dump(self, f, cls=JSONEncoder, separators=(',', ':'))
 
     @classmethod
     def load(cls, path: str | Path):
@@ -328,116 +427,94 @@ class FSM:
                 data = json.loads(fb.read().decode('utf-8'))
         return cls.from_dict(data)
 
-    def _init_emulator(self):
-        if self._has_emu:
-            return
-        self._emu = FSMEmulator(self)
-        self._has_emu = True
-
-    def step(self):
-        self._init_emulator()
-        self._emu.step()
-
-    def reset(self):
-        self._init_emulator()
-        self._emu.reset()
-
-    def run(
-        self,
-        data: dict[str, np.ndarray] | Sequence[np.ndarray] | Sequence[dict[str, np.ndarray]] | np.ndarray,
-        steps: int | None = None,
-        scheduled: bool = True,
-        output_only: bool = True,
-    ) -> dict[str, np.ndarray]:
-        self._init_emulator()
-        return self._emu.run(data, steps, scheduled, output_only)
+    def _init_emu(self):
+        if not self._has_emu:
+            self._emu = FSMEmu(self)
+            self._has_emu = True
 
     def predict(
-        self,
-        data: dict[str, np.ndarray] | Sequence[np.ndarray] | Sequence[dict[str, np.ndarray]] | np.ndarray,
+        self, data: Mapping[str, np.ndarray] | Sequence[np.ndarray] | Sequence[Mapping[str, np.ndarray]] | np.ndarray
     ) -> dict[str, np.ndarray]:
-        self._init_emulator()
+        self._init_emu()
         return self._emu.predict(data)
 
-    @property
-    def states(self) -> dict[str, np.ndarray]:
-        assert self._has_emu, 'Emulator not initialized yet'
-        return self._emu._port_buffers
-
-    def __eq__(self, other: object):
+    def __eq__(self, other: object) -> bool:
         if not isinstance(other, FSM):
             return False
-        return self.logic == other.logic and self.ports == other.ports and self.addr_maps == other.addr_maps
+        return self.logic == other.logic and self.comb_conns == other.comb_conns and self.reg_conns == other.reg_conns
 
 
-class FSMEmulator:
+class FSMEmu:
     def __init__(self, fsm: FSM):
         self.fsm = fsm
-        self._init_buffer(False)
         self._t = 0
+        self._init_buffers()
 
-    def _create_port_buffers(self, exclude_inputs: bool) -> dict[str, np.ndarray]:
-        return {p.name: np.zeros(p.size, dtype=np.float64) for p in self.fsm.ports if not exclude_inputs or p.dir != Dir.IN}
+    def _init_buffers(self):
+        self.buffers = {sig.name: Buffer(sig, dtype=np.float64) for sig in self.fsm.signals.values()}
 
-    def _init_buffer(self, exclude_inputs: bool):
-        self._port_buffers = self._create_port_buffers(exclude_inputs)
-        self._logic_io = {
-            logic.name: (
-                np.empty(logic.logic.shape[0], dtype=np.float64),
-                np.empty(logic.logic.shape[1], dtype=np.float64),
-            )
-            for logic in self.fsm.logic
-        }
+    def _eval_buf(self, name: str):
+        if not (name.startswith('~') and name.endswith(':out')):
+            return self.buffers[name]
+        base = name[1:-4]
+        sig_in_name = f'~{base}:in'
+        val_in = self.buffers[sig_in_name]
+        if not val_in._changed:
+            return self.buffers[name]
+        comb = self.fsm.logic[base]
+        self.buffers[name][:] = comb.predict(val_in, n_threads=1, ignore_lookup_oob=True)
+        return self.buffers[name]
 
-    def step(self):
-        for _map in self.fsm.port_to_logic_map:
-            s = slice(*_map.src_interval)
-            d = slice(*_map.dst_interval)
-            self._logic_io[_map.dst][0][d] = self._port_buffers[_map.src][s]
+    def _eval_conn(self, conn: Conn):
+        if conn.enable_if is None:
+            src = self._eval_buf(conn.src.name)
+        else:
+            if conn.alt_src is None:
+                return  # no update
+            src0, src1 = self._eval_buf(conn.src.name), self._eval_buf(conn.alt_src.name)  # type: ignore
+            cond = self._eval_buf(conn.enable_if.name)[0]
+            src = src0 if cond else src1
+        if not self.buffers[conn.src.name]._changed:
+            return
+        dst = self.buffers[conn.dst.name]
+        s_src, s_dst = slice(*conn.src.view_interval), slice(*conn.dst.view_interval)
+        dst[s_dst] = src[s_src]
 
-        for name, (inp_arr, out_arr) in self._logic_io.items():
-            comb = self.fsm.get_logic(name)
-            if comb.shape[0] == 0:
-                out_arr[:] = comb([], quantize=False)
-            else:
-                out_arr[:] = comb.predict(inp_arr, n_threads=1, ignore_lookup_oob=True)
+    def eval(self):
+        for conn in self.fsm.comb_conns:
+            self._eval_conn(conn)
 
-        new_port_buffers = self._create_port_buffers(True)
-        for _map in self.fsm.logic_to_port_map:
-            s = slice(*_map.src_interval)
-            d = slice(*_map.dst_interval)
-            new_port_buffers[_map.dst] = self._logic_io[_map.src][1][s]
-
-        for _map in self.fsm.port_to_port_map:
-            s = slice(*_map.src_interval)
-            d = slice(*_map.dst_interval)
-            new_port_buffers[_map.dst] = self._port_buffers[_map.src][s]
-
-        for k, v in new_port_buffers.items():
-            self._port_buffers[k][:] = v
-
-        del new_port_buffers
+    def tick(self):
+        for conn in self.fsm.reg_conns:
+            self._eval_conn(conn)
         self._t += 1
 
-    def _has_enough_data(self, data: dict[str, np.ndarray], t0: int, t1: int, scheduled: bool):
-        for port in self.fsm.inp_ports:
-            if scheduled:
-                assert port.schedule is not None, f'Port {port.name} does not have a schedule'
-                n_required = port.schedule.t_to_dense_idx(t1) - port.schedule.t_to_dense_idx(t0)
-            else:
-                n_required = t1 - t0
-            assert len(data[port.name]) >= n_required, f'Not enough data for port {port.name} from t={t0} to t={t1}'
-            if len(data[port.name]) != n_required:
-                warn(
-                    f'Port {port.name} has more data than required from t={t0} to t={t1} ({len(data[port.name])} > {n_required})'
-                )
-
     def reset(self):
-        for port in self.fsm.ports:
-            if port.rst_to is None or not port.need_rst:
-                continue
-            self._port_buffers[port.name][:] = port.rst_to
+        for sig in self.fsm.signals.values():
+            if sig.reg and sig.rst_to is not None:
+                self.buffers[sig.name][:] = sig.rst_to
         self._t = 0
+
+    def canonicalize_inp_data(
+        self, data: Mapping[str, np.ndarray] | Sequence[np.ndarray] | Sequence[Mapping[str, np.ndarray]] | np.ndarray
+    ) -> dict[str, np.ndarray]:
+        datamap: dict[str, np.ndarray]
+        if isinstance(data, np.ndarray):
+            assert len(self.fsm.inp_signals) == 1, 'Data array provided for multiple input signals'
+            datamap = {self.fsm.inp_signals[0].name: data}
+        elif isinstance(data, Sequence) and not isinstance(data, Mapping):
+            assert len(data) > 0, 'Data sequence cannot be empty'
+            _data = data[0]
+            if isinstance(_data, Mapping):
+                datamap = {k: np.concatenate([d[k] for d in data]) for k in _data.keys()}
+            else:
+                assert isinstance(_data, np.ndarray)
+                assert len(data) == len(self.fsm.inp_signals)
+                datamap = {port.name: data[i] for i, port in enumerate(self.fsm.inp_signals)}  # type: ignore
+        else:
+            assert isinstance(data, Mapping)
+            datamap = {k: np.asarray(v) for k, v in data.items()}
+        return datamap
 
     def run(
         self,
@@ -449,71 +526,59 @@ class FSMEmulator:
     ) -> dict[str, np.ndarray]:
 
         t0 = self._t
-        datamap: dict[str, np.ndarray]
-        if isinstance(data, np.ndarray):
-            assert len(self.fsm.inp_ports) == 1, 'Data array provided for multiple input ports'
-            datamap = {self.fsm.inp_ports[0].name: data}
-        elif isinstance(data, Sequence) and not isinstance(data, Mapping):
-            assert len(data) > 0, 'Data sequence cannot be empty'
-            _data = data[0]
-            if isinstance(_data, Mapping):
-                datamap = {k: np.concatenate([d[k] for d in data]) for k in _data.keys()}
-            else:
-                assert isinstance(_data, np.ndarray)
-                assert len(data) == len(self.fsm.inp_ports)
-                datamap = {port.name: data[i] for i, port in enumerate(self.fsm.inp_ports)}  # type: ignore
-        else:
-            assert isinstance(data, Mapping)
-            datamap = {k: np.asarray(v) for k, v in data.items()}
+        data = self.canonicalize_inp_data(data)
 
-        for port in self.fsm.inp_ports:
-            assert port.name in datamap, f'Missing input port {port.name} in data'
+        for port in self.fsm.inp_signals:
+            assert port.name in data, f'Missing input port {port.name} in data'
 
         if scheduled:
-            for port in self.fsm.inp_ports + self.fsm.out_ports:
+            for port in self.fsm.inp_signals + self.fsm.out_signals:
                 assert port.schedule is not None, f'Port {port.name} does not have a schedule'
 
         if not steps:
             if scheduled:
-                steps = min(port.schedule.dense_idx_to_t(len(datamap[port.name]) - 1) for port in self.fsm.inp_ports) + 1  # type: ignore
+                steps = min(port.schedule.dense_idx_to_t(len(data[port.name]) - 1) for port in self.fsm.inp_signals) + 1  # type: ignore
             else:
-                steps = min(len(datamap[port.name]) for port in self.fsm.inp_ports)
+                steps = min(len(data[port.name]) for port in self.fsm.inp_signals)
 
         results = dict[str, np.ndarray]()
-        for port in self.fsm.out_ports:
+        for port in self.fsm.out_signals:
             if scheduled:
                 n_outputs = port.schedule.n_valid_samples_between(t0, t0 + steps + extra_steps)  # type: ignore
             else:
                 n_outputs = steps + extra_steps
             results[port.name] = np.empty((n_outputs, port.size), dtype=np.float64)
         if not output_only:
-            for port in self.fsm.internal_ports:
+            for port in self.fsm.internal_signals:
                 results[port.name] = np.empty((steps + extra_steps, port.size), dtype=np.float64)
 
         for _ in range(steps + extra_steps):
-            for port in self.fsm.inp_ports:
+            for port in self.fsm.inp_signals:
                 if scheduled:
                     if not port.schedule.check(self._t):  # type: ignore
                         continue
                     idx = port.schedule.n_valid_samples_between(t0, self._t + 1) - 1  # type: ignore
                 else:
                     idx = self._t - t0
-                if idx < len(datamap[port.name]):
-                    self._port_buffers[port.name][:] = datamap[port.name][idx]
+                if idx < len(data[port.name]):
+                    self.buffers[port.name][:] = data[port.name][idx]
 
-            self.step()
+            self.eval()
+            self.tick()
+            self.eval()
 
-            for port in self.fsm.out_ports:
+            for port in self.fsm.out_signals:
                 if scheduled:
                     if not port.schedule.check(self._t):  # type: ignore
                         continue
                     idx = port.schedule.n_valid_samples_between(t0, self._t) - 1  # type: ignore
                 else:
                     idx = self._t - t0
-                results[port.name][idx] = self._port_buffers[port.name]
+                results[port.name][idx] = self.buffers[port.name]
             if not output_only:
-                for port in self.fsm.internal_ports:
-                    results[port.name][self._t] = self._port_buffers[port.name]
+                for port in self.fsm.internal_signals:
+                    results[port.name][self._t] = self.buffers[port.name]
+
         return results
 
     def predict(
@@ -521,11 +586,11 @@ class FSMEmulator:
         data: Mapping[str, np.ndarray] | Sequence[np.ndarray] | Sequence[Mapping[str, np.ndarray]] | np.ndarray,
     ) -> dict[str, np.ndarray]:
         _period = set()
-        for port in self.fsm.inp_ports + self.fsm.out_ports:
+        for port in self.fsm.inp_signals + self.fsm.out_signals:
             assert port.schedule is not None, f'Port {port.name} does not have a schedule'
             _period.add(port.schedule.period)
-        assert len(_period) == 1, 'All ports must have the same schedule period'
-        extra_steps = max(port.schedule.bias for port in self.fsm.out_ports)  # type: ignore
+        assert len(_period) == 1, 'All signals must have the same schedule period'
+        extra_steps = max(port.schedule.bias for port in self.fsm.out_signals)  # type: ignore
 
         self.reset()
         return self.run(data, extra_steps=extra_steps - 1, scheduled=True, output_only=True)

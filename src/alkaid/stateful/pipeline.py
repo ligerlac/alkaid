@@ -1,36 +1,55 @@
-from ..types import Pipeline
-from .fsm import FSM, AddrMap, Dir, ModuloSchedule, NamedLogic, NamedPort
+from ..types import CombLogic, Pipeline
+from .fsm import FSM, Conn, ModuloSchedule, Signal, _comb_io_signals
 
 
-def pipeline_to_fsm(pipe: Pipeline) -> FSM:
+def pipeline_to_fsm(pipe: Pipeline, reg_inp=True, reg_out=True) -> FSM:
     lat = len(pipe.solutions)
     assert lat > 0, 'Pipeline must not be empty'
 
-    logics = tuple(NamedLogic(f'logic{i}', sol) for i, sol in enumerate(pipe.solutions))
+    inp_precisions = tuple(qint.kif for qint in pipe.inp_qint)
+    out_precisions = tuple(qint.kif for qint in pipe.out_qint)
 
-    _inp_precisions = tuple(qint.kif for qint in pipe.inp_qint)
-    _out_precisions = tuple(qint.kif for qint in pipe.out_qint)
+    inp_sig = Signal(
+        'model_inp',
+        True,
+        inp_precisions,
+        reg=reg_inp,
+        mode='r',
+        schedule=ModuloSchedule((0,), 1),
+        rst_to=tuple(0.0 for _ in inp_precisions),
+    )
+    out_sig = Signal(
+        'model_out',
+        True,
+        out_precisions,
+        reg=reg_out,
+        mode='w',
+        schedule=ModuloSchedule((lat - 1 + reg_out,), 1),
+        rst_to=tuple(0.0 for _ in out_precisions),
+    )
 
-    inp_port = NamedPort('model_inp', Dir.IN, _inp_precisions, schedule=ModuloSchedule((0,), 1))
-    out_port = NamedPort('model_out', Dir.OUT, _out_precisions, schedule=ModuloSchedule((lat,), 1))
-    _ports = []
-
+    ports: list[Signal] = [inp_sig]
     for i in range(1, lat):
-        _kifs = tuple(qint.kif for qint in pipe.solutions[i].inp_qint)
-        _ports.append(NamedPort(f'stage{i}_inp', Dir.INTERNAL, _kifs, need_rst=False))
+        kifs = tuple(qint.kif for qint in pipe.solutions[i].inp_qint)
+        ports.append(Signal(f'stage{i}_inp', False, kifs, reg=True, mode=''))
+    ports.append(out_sig)
 
-    ports = [inp_port] + _ports + [out_port]
-
-    addr_maps: list[AddrMap] = []
+    logic: dict[str, CombLogic] = {}
+    conns: list[Conn] = []
     for i in range(lat):
-        n_in, n_out = pipe.solutions[i].shape
-        if n_out == 0:
+        comb = pipe.solutions[i]
+        n_in, n_out = comb.shape
+        if n_in == 0 and n_out == 0:
             continue
+        name = f'logic{i}'
+        logic[name] = comb
+        sig_in, sig_out = _comb_io_signals(name, comb)
+        # connect each side that exists; a stage may consume inputs without
+        # producing outputs (e.g. a constant model discards its input), so the
+        # input port stays wired even when there is nothing downstream
         if n_in > 0:
-            addr_map_in = AddrMap(ports[i].name, (0, n_in), logics[i].name, (0, n_in))
-            addr_maps.append(addr_map_in)
-        addr_map_out = AddrMap(logics[i].name, (0, n_out), ports[i + 1].name, (0, n_out))
-        addr_maps.append(addr_map_out)
-    logics = tuple(logic for logic in logics if logic.logic.shape[1] > 0)
+            conns.append(Conn(ports[i], sig_in))  # combinational: register -> logic input wire
+        if n_out > 0:
+            conns.append(Conn(sig_out, ports[i + 1]))  # registered: logic output wire -> next register
 
-    return FSM(logics, tuple(ports), tuple(addr_maps))
+    return FSM(logic, tuple(conns))
