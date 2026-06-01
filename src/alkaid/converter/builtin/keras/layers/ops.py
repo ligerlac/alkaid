@@ -103,6 +103,9 @@ class ReplayMerge(ReplayOperationBase):
         return type(self.op).__name__
 
     def call(self, inputs: tuple[FVArray, ...]) -> FVArray:
+        if self._dispatch_key() == 'Concatenate':
+            return np.concatenate(inputs, axis=self.op.axis)  # type: ignore
+
         _inputs: FVArray = np.stack(np.broadcast_arrays(*inputs), axis=0)  # type: ignore
         match self._dispatch_key():
             case 'Add':
@@ -118,9 +121,6 @@ class ReplayMerge(ReplayOperationBase):
                 return np.amax(_inputs, axis=0)
             case 'Minimum':
                 return np.amin(_inputs, axis=0)
-            case 'Concatenate':
-                return np.concatenate(_inputs, axis=self.op.axis)  # type: ignore
-
             case _:
                 raise TypeError(f'Unsupported layer type: {type(self.op)}')
 
@@ -137,6 +137,8 @@ class ReplayGetItem(ReplayOperationBase):
     handles = (GetItem,)
 
     def call(self, x: FVArray, key) -> FVArray:
+        if isinstance(key, list) and isinstance(key[0], slice):
+            key = tuple(key)
         return x[key]
 
 
