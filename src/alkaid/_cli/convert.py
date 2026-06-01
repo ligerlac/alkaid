@@ -35,8 +35,30 @@ def to_alkaid(
     from alkaid.types import CombLogic
 
     if model_path.suffix in {'.h5', '.keras'}:
-        import hgq  # noqa: F401
+        import zipfile
+
+        import h5py
         import keras
+
+        if model_path.suffix == '.keras':
+            with zipfile.ZipFile(model_path, 'r') as z:
+                with z.open('config.json') as f:
+                    config = json.load(f)
+            base_modules = {layer['module'].split('.', 1)[0] for layer in config['config']['layers']}
+        else:
+            with h5py.File(model_path, 'r', locking=False) as f:
+                ver_str: str = f.attrs['keras_version']  # type: ignore
+                keras_version = tuple(map(int, ver_str.split('.')))
+                assert keras_version >= (3, 0), f'Model defined in keras={keras_version}, keras>=3.0 required'
+                config = json.loads(f.attrs['model_config'])  # type: ignore
+            base_modules = {
+                layer['class_name'].split('>', 1)[0] for layer in config['config']['layers'] if '>' in layer['class_name']
+            }
+        for base_module in base_modules:
+            try:
+                __import__(base_module)
+            except ImportError:
+                pass
 
         model: keras.Model = keras.models.load_model(model_path, compile=False)  # type: ignore
         if verbose > 1:
