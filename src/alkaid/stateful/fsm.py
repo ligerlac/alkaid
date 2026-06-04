@@ -397,29 +397,24 @@ class FSM:
     def _set_signals(self, conns: Sequence[Conn]):
         signals: dict[str, Signal] = {}
 
-        for conn in conns:
-            for sig in conn.src, conn.dst, conn.enable_if, conn.alt_src:
-                if sig is None or sig.name in signals:
-                    continue
-                signals[sig.name] = sig.raw
+        seen_refs: set[int] = set()
 
-        def _recursive_set(sig: Signal):
-            if sig.rst_if is not None and sig.rst_if.name not in signals:
-                sig = sig.rst_if
+        def _add_signal(sig: Signal):
+            if id(sig) in seen_refs:
+                return
+            seen_refs.add(id(sig))
+            if sig.name not in signals:
                 signals[sig.name] = sig.raw
-                _recursive_set(sig)
+            if sig.rst_if is not None:
+                _add_signal(sig.rst_if)
             if sig._dynamic_bias is not None:
                 bias_sig, _ = sig._dynamic_bias
-                if bias_sig.name not in signals:
-                    signals[bias_sig.name] = bias_sig.raw
-                    _recursive_set(bias_sig)
+                _add_signal(bias_sig)
 
-        for sig in list(signals.values()):
-            _recursive_set(sig)
-
-            while sig.rst_if is not None and sig.rst_if.name not in signals:
-                sig = sig.rst_if
-                signals[sig.name] = sig.raw
+        for conn in conns:
+            for sig in conn.src, conn.dst, conn.enable_if, conn.alt_src:
+                if sig is not None:
+                    _add_signal(sig)
 
         for name, comb in self.logic.items():
             sig_in, sig_out = _comb_io_signals(name, comb)

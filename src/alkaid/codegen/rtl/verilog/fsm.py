@@ -19,7 +19,7 @@ def _rst_bin(sig: Signal) -> str:
         w = sum(p)
         number = n << s | number
         s += w
-    return 'h' + hex(number)[2:].upper()
+    return f"{sig.width}'h{hex(number)[2:].upper()}"
 
 
 def gen_assignments(
