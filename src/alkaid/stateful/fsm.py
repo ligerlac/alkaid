@@ -84,8 +84,9 @@ class Signal:
         reg: bool = True,
         schedule: ModuloSchedule | None = None,
         mode: str = '',
-        view_interval: tuple[int, int] | None = None,
+        view: tuple[int, int] | None = None,
         attrs: str | None = None,
+        _dynamic_bias: 'tuple[Signal, int] | None' = None,
     ):
         assert mode in ('', 'r', 'w', 'rw'), 'Mode must be one of "", "r", "w", "rw"'
         if mode in ('r', 'w') and not exposed:
@@ -100,15 +101,33 @@ class Signal:
             self._rst_to = tuple(0.0 for _ in precisions)
         self._precisions = tuple(Precision(*kif) for kif in precisions)
 
+        view = view or (0, len(precisions))
+        if _dynamic_bias is not None:
+            idx, mult = _dynamic_bias
+            assert idx.size == 1
+            prec = idx.precisions[0]
+            assert not prec.signed and prec.fractional == 0
+            i, j = view
+            _prec0 = self._precisions[i:j]
+            _prec1 = self._precisions[i : i + mult]
+            n = j - i
+            N = len(self._precisions) - i
+            while N >= i + n:
+                assert _prec0 == self._precisions[i : i + n] and _prec1 == self._precisions[i : i + mult], (
+                    'Dynamic bias requires repeated patterns in precision'
+                )
+                i += mult
+
         self.name = name
         self.exposed = exposed
         self.rst_if = rst_if
         self.reg = reg
         self.schedule = schedule
         self.mode = mode
-        self.view_interval = view_interval or (0, len(precisions))
+        self._view = view
         self.schedule = ModuloSchedule(*schedule) if isinstance(schedule, Sequence) else schedule
         self.attrs = attrs
+        self._dynamic_bias = _dynamic_bias
 
     def __len__(self):
         return self.size
@@ -120,11 +139,22 @@ class Signal:
         self.mode = self.mode + 'w' if 'w' not in self.mode else self.mode
 
     @property
+    def jump_width(self) -> int:
+        if self._dynamic_bias is None:
+            return 0
+        _, mult = self._dynamic_bias
+        return sum(map(sum, self._precisions[self.view[0] : self.view[0] + mult]))
+
+    @property
+    def view(self) -> tuple[int, int]:
+        return self._view
+
+    @property
     def raw(self) -> 'Signal':
-        if len(self.view_interval) == (0, len(self._precisions)):
+        if len(self.view) == (0, len(self._precisions)):
             return self
         r = copy(self)
-        r.view_interval = (0, len(self._precisions))
+        r._view = (0, len(self._precisions))
         return r
 
     def __eq__(self, other: object) -> bool:
@@ -152,27 +182,29 @@ class Signal:
             self.name,
             self.exposed,
             [list(prec) for prec in self._precisions],
-            self.rst_if.name if self.rst_if is not None else None,
+            self.rst_if.to_list() if self.rst_if is not None else None,
             list(self._rst_to) if self._rst_to is not None else None,
             self.reg,
             self.schedule.to_list() if self.schedule is not None else None,
             self.mode,
             self.attrs,
+            [self._dynamic_bias[0].to_list(), self._dynamic_bias[1]] if self._dynamic_bias is not None else None,
         ]
 
     @classmethod
     def from_list(cls, lst: list) -> 'Signal':
-        name, exposed, precisions, _rst_if_name, rst_to, reg, schedule, mode, attrs = lst
+        name, exposed, precisions, _rst_if_name, rst_to, reg, schedule, mode, attrs, _dynamic_bias = lst
         return cls(
             name,
             exposed,
             tuple(Precision(*prec) for prec in precisions),
-            rst_if=None,
+            rst_if=Signal.from_list(_rst_if_name) if _rst_if_name is not None else None,
             rst_to=tuple(rst_to) if rst_to is not None else None,
             reg=reg,
             schedule=schedule,
             mode=mode,
             attrs=attrs,
+            _dynamic_bias=(Signal.from_list(_dynamic_bias[0]), _dynamic_bias[1]) if _dynamic_bias is not None else None,
         )
 
     def __getitem__(self, idx: int | slice) -> 'Signal':
@@ -180,7 +212,7 @@ class Signal:
             idx = slice(idx, idx + 1)
         assert idx.step is None or idx.step == 1, 'Step is not supported for Signal slicing'
         r = copy(self)
-        r.view_interval = (self.view_interval[0] + idx.start, self.view_interval[0] + idx.stop)
+        r._view = (self.view[0] + idx.start, self.view[0] + idx.stop)
         return r
 
     @property
@@ -193,16 +225,16 @@ class Signal:
 
     @property
     def precisions(self):
-        return self._precisions[self.view_interval[0] : self.view_interval[1]]
+        return self._precisions[self.view[0] : self.view[1]]
 
     @property
     def rst_to(self):
         if self._rst_to is None:
             return None
-        return self._rst_to[self.view_interval[0] : self.view_interval[1]]
+        return self._rst_to[self.view[0] : self.view[1]]
 
     def __repr__(self):
-        return f'Signal({self.name}[{self.view_interval[0]}:{self.view_interval[1]}])'
+        return f'Signal({self.name}[{self.view[0]}:{self.view[1]}])'
 
 
 @dataclass
@@ -258,7 +290,7 @@ def _check_single_assignment(conns: Sequence[Conn]):
     """Raise if two conns drive overlapping bits of the same signal."""
     writes: dict[str, list[tuple[int, int, int]]] = {}
     for i, conn in enumerate(conns):
-        lo, hi = conn.dst.view_interval
+        lo, hi = conn.dst.view
         writes.setdefault(conn.dst.name, []).append((lo, hi, i))
     for name, ws in writes.items():
         ws.sort()
@@ -310,7 +342,7 @@ def _remove_const_logic(logic: dict[str, CombLogic], conns: Sequence[Conn]) -> t
         if sig is None or sig.name not in const_signals:
             return sig
         const = const_signals[sig.name]
-        return const[sig.view_interval[0] : sig.view_interval[1]]
+        return const[sig.view[0] : sig.view[1]]
 
     def remap_conn(conn: Conn):
         return Conn(
@@ -371,7 +403,20 @@ class FSM:
                     continue
                 signals[sig.name] = sig.raw
 
+        def _recursive_set(sig: Signal):
+            if sig.rst_if is not None and sig.rst_if.name not in signals:
+                sig = sig.rst_if
+                signals[sig.name] = sig.raw
+                _recursive_set(sig)
+            if sig._dynamic_bias is not None:
+                bias_sig, _ = sig._dynamic_bias
+                if bias_sig.name not in signals:
+                    signals[bias_sig.name] = bias_sig.raw
+                    _recursive_set(bias_sig)
+
         for sig in list(signals.values()):
+            _recursive_set(sig)
+
             while sig.rst_if is not None and sig.rst_if.name not in signals:
                 sig = sig.rst_if
                 signals[sig.name] = sig.raw
@@ -471,6 +516,13 @@ class FSMEmu:
         self.buffers[name][:] = comb.predict(val_in, n_threads=1, ignore_lookup_oob=True)
         return self.buffers[name]
 
+    def _get_bias(self, sig: Signal) -> int:
+        if sig._dynamic_bias is None:
+            return 0
+        bias_sig, mult = sig._dynamic_bias
+        bias_val = self.buffers[bias_sig.name][bias_sig.view[0]]
+        return int(bias_val) * mult
+
     def _eval_conn(self, conn: Conn):
         if conn.enable_if is None:
             src = self._eval_buf(conn.src.name)
@@ -483,7 +535,9 @@ class FSMEmu:
         if not self.buffers[conn.src.name]._changed:
             return
         dst = self.buffers[conn.dst.name]
-        s_src, s_dst = slice(*conn.src.view_interval), slice(*conn.dst.view_interval)
+        _bias_src, _bias_dst = self._get_bias(conn.src), self._get_bias(conn.dst)
+        s_src = slice(conn.src.view[0] + _bias_src, conn.src.view[1] + _bias_src)
+        s_dst = slice(conn.dst.view[0] + _bias_dst, conn.dst.view[1] + _bias_dst)
         dst[s_dst] = src[s_src]
 
     def eval(self):

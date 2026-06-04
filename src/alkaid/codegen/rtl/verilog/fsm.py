@@ -19,20 +19,34 @@ def _rst_bin(sig: Signal) -> str:
     return 'h' + hex(number)[2:].upper()
 
 
-def gen_assignments(map_out: list[BitMap], name_inp: str, name_out: str, clocked: bool):
+def gen_assignments(
+    map_out: list[BitMap],
+    name_inp: str,
+    name_out: str,
+    clocked: bool,
+    inp_offset: str | None = None,
+    out_offset: str | None = None,
+):
     def to_assign_str(name_inp: str, name_out: str):
         if not clocked:
             return f'assign {name_out} = {name_inp};'
         else:
             return f'{name_out} <= {name_inp};'
 
+    def _name(name: str, lo: int, hi: int, offset: str | None) -> str:
+        if offset is None:
+            return f'{name}[{hi - 1}:{lo}]'
+        start = f'{lo} + {offset}' if lo else offset
+        return f'{name}[{start} +: {hi - lo}]'
+
     assignments = []
     for (ii, ji), (io, jo) in map_out:
-        name_out = f'{name_out}[{jo - 1}:{io}]'
+        name_out = _name(name_out, io, jo, out_offset)
         if ji - ii == jo - io:
-            name_inp = f'{name_inp}[{ji - 1}:{ii}]'
+            name_inp = _name(name_inp, ii, ji, inp_offset)
         elif ji - ii == 1:
-            name_inp = f'{{{jo - io}{{{name_inp}[{ii}]}}}}'
+            bit = f'{name_inp}[{ii} + {inp_offset}]' if inp_offset is not None else f'{name_inp}[{ii}]'
+            name_inp = f'{{{jo - io}{{{bit}}}}}'
         else:
             assert ii == ji == -1, f'Unexpected map_out entry: {(ii, ji), (io, jo)}'
             name_inp = f"{jo - io}'b0"
@@ -40,21 +54,32 @@ def gen_assignments(map_out: list[BitMap], name_inp: str, name_out: str, clocked
     return assignments
 
 
+def _get_dyn_offset(sig: Signal) -> str | None:
+    """Verilog bit-offset expression `idx * jump_width` for a dynamically-biased view, else None."""
+    if sig._dynamic_bias is None:
+        return None
+    idx = sig._dynamic_bias[0]
+    lo = sum(sum(p) for p in idx.raw.precisions[: idx.view[0]])
+    hi = lo + sum(idx.bitwidths)
+    return f'{idx.name}[{hi - 1}:{lo}] * {sig.jump_width}'
+
+
 def gen_assignments_conn(conn: Conn) -> str:
-    io_map, _ = gen_io_map(conn.src.precisions, conn.dst.precisions, True, conn.src.view_interval[0], conn.dst.view_interval[0])
-    assignments = gen_assignments(io_map, conn.src.name, conn.dst.name, conn.clocked)
+    src_off, dst_off = _get_dyn_offset(conn.src), _get_dyn_offset(conn.dst)
+    io_map, _ = gen_io_map(conn.src.precisions, conn.dst.precisions, True, conn.src.view[0], conn.dst.view[0])
+    assignments = gen_assignments(io_map, conn.src.name, conn.dst.name, conn.clocked, src_off, dst_off)
     assignments_str = '\n        '.join(assignments)
     esig = conn.enable_if
     if esig is not None:
-        enable_sig_name = f'{esig.name}[{esig.view_interval[0]}]' if esig.raw.width > 1 else esig.name
+        enable_sig_name = f'{esig.name}[{esig.view[0]}]' if esig.raw.width > 1 else esig.name
     else:
         enable_sig_name = None
 
     if conn.alt_src is not None:
-        alt_io_map, _ = gen_io_map(
-            conn.alt_src.precisions, conn.dst.precisions, True, conn.alt_src.view_interval[0], conn.dst.view_interval[0]
+        alt_io_map, _ = gen_io_map(conn.alt_src.precisions, conn.dst.precisions, True, conn.alt_src.view[0], conn.dst.view[0])
+        alt_assignments = gen_assignments(
+            alt_io_map, conn.alt_src.name, conn.dst.name, conn.clocked, _get_dyn_offset(conn.alt_src), dst_off
         )
-        alt_assignments = gen_assignments(alt_io_map, conn.alt_src.name, conn.dst.name, conn.clocked)
         alt_assignments_str = '\n        '.join(alt_assignments)
         assert enable_sig_name is not None
         block = f"""    if ({enable_sig_name}) begin: _enabled
@@ -69,7 +94,7 @@ def gen_assignments_conn(conn: Conn) -> str:
     if conn.clocked:
         if conn.dst.rst_if is not None:
             rst_sig = conn.dst.rst_if
-            rst_sig_name = f'{rst_sig.name}[{rst_sig.view_interval[0]}]' if rst_sig.raw.width > 1 else rst_sig.name
+            rst_sig_name = f'{rst_sig.name}[{rst_sig.view[0]}]' if rst_sig.raw.width > 1 else rst_sig.name
             block = block.replace('\n', '\n    ')
             block = f'    if (~{rst_sig_name}) begin: _not_rst\n{block}\n    end'
         return block
@@ -155,7 +180,7 @@ def fsm_logic_gen(
         for sig in sig_need_reset:
             rst_sig = sig.rst_if
             assert rst_sig is not None
-            rst_sig_name = f'{rst_sig.name}[{rst_sig.view_interval[0]}]' if rst_sig.raw.width > 1 else rst_sig.name
+            rst_sig_name = f'{rst_sig.name}[{rst_sig.view[0]}]' if rst_sig.raw.width > 1 else rst_sig.name
             rst_val = _rst_bin(sig)
             rst_block = f"""    if (~{rst_sig_name}) begin: _reset_{sig.name}
         {sig.name} <= {rst_val};

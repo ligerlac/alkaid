@@ -53,7 +53,7 @@ def topo_check_and_sort(conns: Sequence[Conn]) -> list[Conn]:
 
     for i, conn in enumerate(conns):
         # a signal view's absolute bit range is exactly its view_interval
-        ws, we = conn.dst.view_interval
+        ws, we = conn.dst.view
         writes_by_signal.setdefault(conn.dst.name, []).append((ws, we, i))
         dkey, dnode = _node(conn.dst.name)
         _slot(dkey, dnode)['w'].append((ws, we, i))
@@ -62,7 +62,7 @@ def topo_check_and_sort(conns: Sequence[Conn]) -> list[Conn]:
         if conn.alt_src is not None:
             src_reads.append(conn.alt_src)
         for sig in src_reads:
-            rs, re = sig.view_interval
+            rs, re = sig.view
             rkey, rnode = _node(sig.name)
             _slot(rkey, rnode)['r'].append((rs, re, i))
 
