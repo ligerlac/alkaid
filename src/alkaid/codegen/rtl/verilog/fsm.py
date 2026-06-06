@@ -10,13 +10,11 @@ from .io_map import BitMap, gen_io_map
 
 def _rst_bin(sig: Signal) -> str:
     assert sig.rst_to is not None
-    val = np.round(
-        np.array(sig.rst_to, dtype=np.float64) * 2.0 ** -np.array([prec.fractional for prec in sig.precisions])
-    ).astype(np.uint64)
     s = 0
     number = 0
-    for n, p in zip(val, sig.precisions):
+    for val, p in zip(sig.rst_to, sig.precisions):
         w = sum(p)
+        n = round(float(val) * (2.0**p.fractional)) & ((1 << w) - 1)
         number = n << s | number
         s += w
     return f"{sig.width}'h{hex(number)[2:].upper()}"
@@ -57,19 +55,23 @@ def gen_assignments(
     return assignments
 
 
+def _bit_offset(sig: Signal) -> int:
+    return sum(sum(p) for p in sig.raw.precisions[: sig.view[0]])
+
+
 def _get_dyn_offset(sig: Signal) -> str | None:
     """Verilog bit-offset expression `idx * jump_width` for a dynamically-biased view, else None."""
     if sig._dynamic_bias is None:
         return None
     idx = sig._dynamic_bias[0]
-    lo = sum(sum(p) for p in idx.raw.precisions[: idx.view[0]])
+    lo = _bit_offset(sig)
     hi = lo + sum(idx.bitwidths)
     return f'{idx.name}[{hi - 1}:{lo}] * {sig.jump_width}'
 
 
 def gen_assignments_conn(conn: Conn) -> str:
     src_off, dst_off = _get_dyn_offset(conn.src), _get_dyn_offset(conn.dst)
-    io_map, _ = gen_io_map(conn.src.precisions, conn.dst.precisions, True, conn.src.view[0], conn.dst.view[0])
+    io_map, _ = gen_io_map(conn.src.precisions, conn.dst.precisions, True, _bit_offset(conn.src), _bit_offset(conn.dst))
     assignments = gen_assignments(io_map, conn.src.name, conn.dst.name, conn.clocked, src_off, dst_off)
     assignments_str = '\n        '.join(assignments)
     esig = conn.enable_if
@@ -79,15 +81,17 @@ def gen_assignments_conn(conn: Conn) -> str:
         enable_sig_name = None
 
     if conn.alt_src is not None:
-        alt_io_map, _ = gen_io_map(conn.alt_src.precisions, conn.dst.precisions, True, conn.alt_src.view[0], conn.dst.view[0])
+        alt_io_map, _ = gen_io_map(
+            conn.alt_src.precisions, conn.dst.precisions, True, _bit_offset(conn.alt_src), _bit_offset(conn.dst)
+        )
         alt_assignments = gen_assignments(
             alt_io_map, conn.alt_src.name, conn.dst.name, conn.clocked, _get_dyn_offset(conn.alt_src), dst_off
         )
         alt_assignments_str = '\n        '.join(alt_assignments)
         assert enable_sig_name is not None
-        block = f"""    if ({enable_sig_name}) begin: _enabled
+        block = f"""    if ({enable_sig_name}) begin: _enabled_{conn.dst.name}
         {assignments_str}
-    end else begin: _alt
+    end else begin: _alt_{conn.dst.name}
         {alt_assignments_str}
     end
 """
@@ -183,9 +187,7 @@ def fsm_logic_gen(
 
     sig_need_initial = [sig for sig in fsm.signals.values() if sig.reg and sig.rst_to is not None]
     rst_values = [_rst_bin(sig) for sig in sig_need_initial]
-    rst_assignments_str = '\n        '.join(
-        [f'assign {sig.name} = {rst_val};' for sig, rst_val in zip(sig_need_initial, rst_values)]
-    )
+    rst_assignments_str = '\n        '.join([f'{sig.name} = {rst_val};' for sig, rst_val in zip(sig_need_initial, rst_values)])
     if sig_need_initial:
         initial = f"""\n\n    initial begin: _fsm_init_registers
         {rst_assignments_str}
@@ -203,7 +205,7 @@ def fsm_logic_gen(
             assert rst_sig is not None
             rst_sig_name = f'{rst_sig.name}[{rst_sig.view[0]}]' if rst_sig.raw.width > 1 else rst_sig.name
             rst_val = _rst_bin(sig)
-            rst_block = f"""    if (~{rst_sig_name}) begin: _reset_{sig.name}
+            rst_block = f"""    if ({rst_sig_name}) begin: _reset_{sig.name}
         {sig.name} <= {rst_val};
     end"""
             rst_blocks.append(rst_block)

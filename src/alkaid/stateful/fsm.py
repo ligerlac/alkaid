@@ -78,7 +78,7 @@ class Signal:
         self,
         name: str,
         exposed: bool,
-        precisions: tuple[Precision, ...],
+        precisions: tuple[Precision, ...] | tuple[tuple[bool | int, int, int], ...],
         rst_if: 'Signal | None' = None,
         rst_to: tuple[float, ...] | tuple[int, ...] | None = None,
         reg: bool = True,
@@ -99,7 +99,7 @@ class Signal:
             self._rst_to = tuple(_quantize(x, *kif) for x, kif in zip(rst_to, precisions))
         elif rst_if is not None:
             self._rst_to = tuple(0.0 for _ in precisions)
-        self._precisions = tuple(Precision(*kif) for kif in precisions)
+        self._precisions = tuple(Precision(bool(kif[0]), kif[1], kif[2]) for kif in precisions)
 
         view = view or (0, len(precisions))
         if _dynamic_bias is not None:
@@ -306,6 +306,10 @@ class Buffer(np.ndarray):
             obj[:] = sig.rst_to
         obj._changed = False
         return obj
+
+    def __array_finalize__(self, obj):
+        if obj is not None:
+            self._changed = getattr(obj, '_changed', False)
 
     def __setitem__(self, key, value):
         super().__setitem__(key, value)
@@ -518,7 +522,16 @@ class FSMEmu:
         bias_val = self.buffers[bias_sig.name][bias_sig.view[0]]
         return int(bias_val) * mult
 
-    def _eval_conn(self, conn: Conn):
+    def _is_reset(self, sig: Signal) -> bool:
+        if sig.rst_if is None:
+            return False
+        rst_val = self.buffers[sig.rst_if.name][sig.rst_if.view[0]]
+        return bool(rst_val)  # active-high: reset asserted when the rst_if line is 1
+
+    def _eval_conn(self, conn: Conn, staged: dict[str, Buffer] | None = None):
+        staged = staged if staged is not None else self.buffers
+        if self._is_reset(conn.dst):
+            return
         if conn.enable_if is None:
             src = self._eval_buf(conn.src.name)
         else:
@@ -529,7 +542,7 @@ class FSMEmu:
             src = src0 if cond else src1
         if not self.buffers[conn.src.name]._changed:
             return
-        dst = self.buffers[conn.dst.name]
+        dst = staged[conn.dst.name]
         _bias_src, _bias_dst = self._get_bias(conn.src), self._get_bias(conn.dst)
         s_src = slice(conn.src.view[0] + _bias_src, conn.src.view[1] + _bias_src)
         s_dst = slice(conn.dst.view[0] + _bias_dst, conn.dst.view[1] + _bias_dst)
@@ -540,8 +553,16 @@ class FSMEmu:
             self._eval_conn(conn)
 
     def tick(self):
+        staged: dict[str, Buffer] = {sig.name: self.buffers[sig.name].copy() for sig in self.fsm.signals.values() if sig.reg}
         for conn in self.fsm.reg_conns:
-            self._eval_conn(conn)
+            self._eval_conn(conn, staged)
+        for name, buf in staged.items():
+            if self._is_reset(self.fsm.signals[name]):
+                rst_to = self.fsm.signals[name].rst_to
+                self.buffers[name][:] = rst_to
+            else:
+                self.buffers[name][:] = buf
+                self.buffers[name]._changed = buf._changed
         self._t += 1
 
     def reset(self):
