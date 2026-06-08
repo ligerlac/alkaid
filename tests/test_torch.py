@@ -423,6 +423,11 @@ class TestBitwiseOp:
         )
 
 
+class TestBitwiseNot:
+    def test(self):
+        _run(lambda x: ~(x.to(torch.bool)), [(16,)], kif=(1, 1, 0))
+
+
 class TestReduction:
     @pytest.fixture(
         params=[
@@ -905,9 +910,12 @@ class TestMethodClone:
 
 
 class TestMethodTo:
-    def test(self):
+    @pytest.mark.parametrize(
+        'dtype', [torch.float32, torch.uint8, torch.int8, torch.bool], ids=['float32', 'uint8', 'int8', 'bool']
+    )
+    def test(self, dtype):
         # .to / .float are no-ops in replay (dtype metadata only)
-        _run(lambda x: x.to(torch.float32).float(), [(8,)])
+        _run(lambda x: x.to(dtype), [(8,)])
 
 
 class TestMethodSum:

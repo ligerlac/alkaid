@@ -10,6 +10,8 @@ from typing import Any
 
 import numpy as np
 
+from alkaid.trace.ops import quantize
+
 _method_map: dict[str, Callable] = {}
 
 
@@ -96,8 +98,31 @@ def _size(receiver: Any, *args: Any, **_kwargs: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 
-@_method('contiguous', 'clone', 'detach', 'to', 'type_as', 'float', 'double', 'int', 'long')
+@_method('contiguous', 'clone', 'detach', 'type_as', 'float', 'double', 'int', 'long')
 def _identity(receiver: Any, *_args: Any, **_kwargs: Any) -> Any:
+    return receiver
+
+
+@_method('to')
+def _to(receiver: Any, *args: Any, **kwargs: Any) -> Any:
+    import torch
+
+    _torch_integers = {
+        torch.uint8: (0, 8),
+        torch.int8: (1, 7),
+        torch.uint16: (0, 16),
+        torch.int16: (1, 15),
+        torch.uint32: (0, 32),
+        torch.int32: (1, 31),
+        torch.uint64: (0, 64),
+        torch.int64: (1, 63),
+    }
+    dtype_to = kwargs.get('dtype', args[0] if args else None)
+    if dtype_to == torch.bool:
+        return receiver != 0
+    if dtype_to in _torch_integers:
+        s, i = _torch_integers[dtype_to]
+        return quantize(np.where(receiver < 0, np.ceil(receiver), np.floor(receiver)), s, i, 0)
     return receiver
 
 

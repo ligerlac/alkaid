@@ -690,7 +690,15 @@ _functional(operator.pos)(lambda x: +x)
 _functional(operator.and_, torch.bitwise_and)(lambda a, b: a & b)
 _functional(operator.or_, torch.bitwise_or)(lambda a, b: a | b)
 _functional(operator.xor, torch.bitwise_xor)(lambda a, b: a ^ b)
-_functional(operator.invert, torch.bitwise_not)(lambda x: ~x)
+
+
+@_functional(operator.invert, torch.bitwise_not)
+def _bitwise_not(x: FVArray):
+    k, i, f = x.kif
+    assert np.all(k == 0) and np.all(i == 1) and np.all(f == 0), 'only boolean-like bitwise_not is supported'
+    return ~x
+
+
 _functional(operator.eq)(np.equal)
 _functional(operator.ne)(np.not_equal)
 _functional(operator.lt)(np.less)
