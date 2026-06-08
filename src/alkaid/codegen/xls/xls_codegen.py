@@ -87,25 +87,29 @@ def _build_core_ops(bb, pkg, sol, model_inp, inp_starts, inp_widths, kifs, width
 
         match op.opcode:
             case -2:  # Negation
-                bw0 = widths[op.id0]
-                is_signed = ops[op.id0].qint.min < 0
-                buf[i] = negate(bb, buf[op.id0], bw0, bw, is_signed)
+                a = op.addr[0]
+                bw0 = widths[a]
+                is_signed = ops[a].qint.min < 0
+                buf[i] = negate(bb, buf[a], bw0, bw, is_signed)
 
             case -1:  # Input
-                start = inp_starts[op.id0]
+                start = inp_starts[op.data[0]]
                 buf[i] = bb.add_bit_slice(model_inp, start, bw)
 
-            case 0 | 1:  # Add/Sub with shift
-                p0, p1 = kifs[op.id0], kifs[op.id1]
-                bw0, bw1 = widths[op.id0], widths[op.id1]
+            case 0 | 1:  # Binary add/sub with shift
+                assert len(op.addr) == 2 and len(op.data) == 1
+                a, b = op.addr
+                data_shift = op.data[0]
+                p0, p1 = kifs[a], kifs[b]
+                bw0, bw1 = widths[a], widths[b]
                 s0, f0, s1, f1 = int(p0[0]), p0[2], int(p1[0]), p1[2]
-                shift = op.data + f0 - f1
-                dlsbs = max(f0, f1 - op.data) - kifs[i][2]
+                shift = data_shift + f0 - f1
+                dlsbs = max(f0, f1 - data_shift) - kifs[i][2]
 
                 buf[i] = shift_adder(
                     bb,
-                    buf[op.id0],
-                    buf[op.id1],
+                    buf[a],
+                    buf[b],
                     bw0,
                     bw1,
                     s0,
@@ -117,11 +121,12 @@ def _build_core_ops(bb, pkg, sol, model_inp, inp_starts, inp_widths, kifs, width
                 )
 
             case 2:  # ReLU
-                lsb_bias = kifs[op.id0][2] - kifs[i][2]
-                v0 = buf[op.id0]
-                bw0 = widths[op.id0]
+                a = op.addr[0]
+                lsb_bias = kifs[a][2] - kifs[i][2]
+                v0 = buf[a]
+                bw0 = widths[a]
 
-                if ops[op.id0].qint.min < 0:
+                if ops[a].qint.min < 0:
                     # Signed: zero if negative (MSB=1)
                     msb = bb.add_bit_slice(v0, bw0 - 1, 1)
                     sliced = bb.add_bit_slice(v0, lsb_bias, bw)
@@ -131,25 +136,26 @@ def _build_core_ops(bb, pkg, sol, model_inp, inp_starts, inp_widths, kifs, width
                     buf[i] = bb.add_bit_slice(v0, lsb_bias, bw)
 
             case 3:  # Quantize (bit slice with possible sign extension)
-                lsb_bias = kifs[op.id0][2] - kifs[i][2]
+                a = op.addr[0]
+                lsb_bias = kifs[a][2] - kifs[i][2]
                 i0 = bw + lsb_bias - 1
-                v0 = buf[op.id0]
-                bw0 = widths[op.id0]
+                v0 = buf[a]
+                bw0 = widths[a]
 
                 if i0 >= bw0:
-                    assert ops[op.id0].qint.min < 0
+                    assert ops[a].qint.min < 0
                     v0_ext = bb.add_sign_extend(v0, i0 + 1)
                     buf[i] = bb.add_bit_slice(v0_ext, lsb_bias, bw)
                 else:
                     buf[i] = bb.add_bit_slice(v0, lsb_bias, bw)
 
             case 4:  # Const addition
-                val = ((op.data & 0xFFFFFFFF) + 0x80000000) % 0x100000000 - 0x80000000
-                f1 = (((op.data >> 32) & 0xFFFFFFFF) + 0x80000000) % 0x100000000 - 0x80000000
-                bw0 = widths[op.id0]
+                a = op.addr[0]
+                val, f1 = op.data
+                bw0 = widths[a]
                 bw1 = max(1, int(ceil(log2(abs(val) + 1))))
-                s0 = int(kifs[op.id0][0])
-                f0 = kifs[op.id0][2]
+                s0 = int(kifs[a][0])
+                f0 = kifs[a][2]
                 s1 = int(val < 0)
                 shift = f0 - f1
                 dlsbs = max(f0, f1) - kifs[i][2]
@@ -159,7 +165,7 @@ def _build_core_ops(bb, pkg, sol, model_inp, inp_starts, inp_widths, kifs, width
 
                 buf[i] = shift_adder(
                     bb,
-                    buf[op.id0],
+                    buf[a],
                     const_lit,
                     bw0,
                     bw1,
@@ -172,29 +178,25 @@ def _build_core_ops(bb, pkg, sol, model_inp, inp_starts, inp_widths, kifs, width
                 )
 
             case 5:  # Const definition
-                num = op.data
+                num = op.data[0]
                 if num < 0:
                     num = (1 << bw) + num
                 buf[i] = _literal(bb, bw, num)
 
             case 6:  # MSB Mux
-                id_c = op.data & 0xFFFFFFFF
-                a_idx, b_idx = op.id0, op.id1
+                a_idx, b_idx, id_c = op.addr
                 p0, p1 = kifs[a_idx], kifs[b_idx]
                 bwk, bw0, bw1 = widths[id_c], widths[a_idx], widths[b_idx]
                 s0, f0, s1, f1 = int(p0[0]), p0[2], int(p1[0]), p1[2]
                 fo = kifs[i][2]
-                _shift_raw = (op.data >> 32) & 0xFFFFFFFF
-                _shift_raw = _shift_raw if _shift_raw < 0x80000000 else _shift_raw - 0x100000000
-                shift1 = fo - f1 + _shift_raw
+                shift1 = fo - f1 + op.data[0]
                 shift0 = fo - f0
                 assert shift0 == 0 or shift1 == 0
                 shift = shift1 * (shift1 > 0) - shift0 * (shift0 > 0)
-                inv = 0
 
                 in0_need = bw0 - shift if shift < 0 else bw0
                 in1_need = bw1 + shift if shift > 0 else bw1
-                extra_pad = (inv + 1) if (s0 != s1) else (inv + 0)
+                extra_pad = 1 if s0 != s1 else 0
                 bw_buf = max(in0_need, in1_need) + extra_pad
 
                 va = buf[a_idx] if bw0 > 0 else _literal(bb, 1, 0)
@@ -222,11 +224,12 @@ def _build_core_ops(bb, pkg, sol, model_inp, inp_starts, inp_widths, kifs, width
                 buf[i] = bb.add_select(msb, [vb_out, va_out])
 
             case 7:  # Multiplication
-                bw0, bw1 = widths[op.id0], widths[op.id1]
-                s0, s1 = int(kifs[op.id0][0]), int(kifs[op.id1][0])
+                a, b = op.addr
+                bw0, bw1 = widths[a], widths[b]
+                s0, s1 = int(kifs[a][0]), int(kifs[b][0])
                 bw_prod = bw0 + bw1
 
-                v0, v1 = buf[op.id0], buf[op.id1]
+                v0, v1 = buf[a], buf[b]
 
                 if s0 and s1:
                     v0_ext = bb.add_sign_extend(v0, bw_prod)
@@ -249,9 +252,10 @@ def _build_core_ops(bb, pkg, sol, model_inp, inp_starts, inp_widths, kifs, width
 
             case 8:  # Lookup table
                 assert sol.lookup_tables is not None
-                table = sol.lookup_tables[op.data]
+                a = op.addr[0]
+                table = sol.lookup_tables[op.data[0]]
                 out_bw = bw
-                padded = table.padded_table(ops[op.id0].qint)
+                padded = table.padded_table(ops[a].qint)
 
                 elem_type = pkg.get_bits_type(out_bw)
                 elements = []
@@ -262,11 +266,11 @@ def _build_core_ops(bb, pkg, sol, model_inp, inp_starts, inp_widths, kifs, width
                         elements.append(_literal(bb, out_bw, int(v) & ((1 << out_bw) - 1)))
 
                 arr = bb.add_array(elem_type, elements)
-                buf[i] = bb.add_array_index(arr, [buf[op.id0]])
+                buf[i] = bb.add_array_index(arr, [buf[a]])
 
             case 9:  # Unary bitwise
-                v0 = buf[op.id0]
-                match op.data:
+                v0 = buf[op.addr[0]]
+                match op.data[0]:
                     case 0:
                         buf[i] = bb.add_not(v0)
                     case 1:
@@ -277,22 +281,21 @@ def _build_core_ops(bb, pkg, sol, model_inp, inp_starts, inp_widths, kifs, width
                         raise ValueError(f'Unknown unary bitwise op {op.data}')
 
             case 10:  # Binary bitwise
-                data = op.data
-                subop = (data >> 56) & 0xFF
-                _shift = data & 0xFFFFFFFF
-                shift = (_shift + 0x80000000) % 0x100000000 - 0x80000000 + kifs[op.id0][2] - kifs[op.id1][2]
+                a, b = op.addr
+                data_shift, subop = op.data
+                shift = data_shift + kifs[a][2] - kifs[b][2]
 
-                bw0, bw1 = widths[op.id0], widths[op.id1]
-                s0 = int(ops[op.id0].qint.min < 0)
-                s1 = int(ops[op.id1].qint.min < 0)
+                bw0, bw1 = widths[a], widths[b]
+                s0 = int(ops[a].qint.min < 0)
+                s1 = int(ops[b].qint.min < 0)
 
                 in0_need = bw0 - shift if shift < 0 else bw0
                 in1_need = bw1 + shift if shift > 0 else bw1
                 extra_pad = 1 if (s0 != s1) else 0
                 bw_tmp = max(in0_need, in1_need) + extra_pad
 
-                v0 = buf[op.id0]
-                v1 = buf[op.id1]
+                v0 = buf[a]
+                v1 = buf[b]
 
                 if shift < 0:
                     pad_r = -shift
@@ -323,6 +326,9 @@ def _build_core_ops(bb, pkg, sol, model_inp, inp_starts, inp_widths, kifs, width
                         raise ValueError(f'Unknown binary bitwise subop {subop}')
 
                 buf[i] = bb.add_bit_slice(result, 0, bw)
+
+            case 11:
+                raise ValueError(f'XLS codegen does not support variadic opcode 11: {op}')
 
             case _:
                 raise ValueError(f'Unknown opcode {op.opcode}')

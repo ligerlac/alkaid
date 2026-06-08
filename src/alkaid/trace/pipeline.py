@@ -10,18 +10,8 @@ from .passes import canonical_sort, dead_code_elimin
 def _index_remap(op: Op, idx_map: dict[int, int]) -> Op:
     if op.opcode == -1:
         return op
-    id0 = op.id0
-    id1 = op.id1
-    id0 = idx_map.get(id0, id0)
-    id1 = idx_map.get(id1, id1)
-    if op.opcode == 6:  # msb_mux
-        id_c = op.data & 0xFFFFFFFF
-        shift = (op.data >> 32) & 0xFFFFFFFF
-        id_c = idx_map.get(id_c, id_c)
-        data = id_c + (shift << 32)
-    else:
-        data = op.data
-    return Op(id0, id1, op.opcode, data, op.qint, op.latency, op.cost)
+    addr = tuple(idx_map.get(i, i) for i in op.addr)
+    return Op(addr, op.opcode, op.data, op.qint, op.latency, op.cost)
 
 
 def to_pipeline(comb: CombLogic, n_stages: int | None = None, latency_cutoff: float | None = None, verbose=True) -> Pipeline:
@@ -86,7 +76,7 @@ def to_pipeline(comb: CombLogic, n_stages: int | None = None, latency_cutoff: fl
             _op = comb.ops[gi]
             index_map[gi] = i
             if _op.opcode != 5:
-                ops.append(Op(inp_idx, -1, -1, 0, _op.qint, _op.latency, 0))
+                ops.append(Op((), -1, (inp_idx,), _op.qint, _op.latency, 0))
                 inp_idx += 1
             else:
                 ops.append(_op)  # const copy

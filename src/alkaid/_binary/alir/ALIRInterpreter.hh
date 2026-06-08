@@ -24,22 +24,26 @@ namespace alir {
         std::vector<int32_t> out_negs;
         std::vector<std::vector<int32_t>> lookup_tables;
 
-        std::vector<OpExec> ops_exec;
+        std::vector<Op> ops;
+        std::vector<Op_SumTerm> sum_terms;
 
         std::vector<double> input_scales;   // per-op (-1 only)
         std::vector<double> output_scales;  // per output
         std::vector<double> op_dump_scales; // per op
 
-        std::vector<int32_t> op_out_addr; // op -> slot, kept for dump path
-
-        void build_exec_program(const std::vector<Op> &ops);
+        void build_exec_program(
+            std::vector<Op> program,
+            const std::vector<uint32_t> &addr_pool,
+            const std::vector<int64_t> &data_pool,
+            const std::vector<DType> &dtypes
+        );
 
         template <int B> void exec_batch_core(const double *inputs, size_t batch_size, int64_t *buffer) const;
 
       public:
-        static const int alir_version = 2;
+        static const int alir_version = 3;
 
-        void load_from_bytecode(const std::span<const int32_t> &binary_data);
+        void load_from_bytecode(const std::span<const uint8_t> &binary_data);
 
         // Accept CombLogic JSON directly; handles gzip and plain.
         void load_from_json_file(const std::string &path);

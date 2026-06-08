@@ -1,6 +1,7 @@
 import gzip
 import json
 import os
+import struct
 from collections.abc import Sequence
 from functools import reduce, singledispatch
 from math import floor
@@ -13,11 +14,11 @@ from numpy.typing import NDArray
 
 from ._binary import (
     alir_interp_run,
-    minimal_kif_batch,
     minimal_kif_scalar,
 )
 
-ALIR_SPEC_VERSION = 2
+ALIR_SPEC_VERSION = 3
+ALIR_BYTECODE_MAGIC = b'ALIR'
 
 
 if TYPE_CHECKING:
@@ -50,14 +51,13 @@ class Op(NamedTuple):
 
     Parameters
     ----------
-    id0: int
-        Index of the first operand, or the input index for opcode -1.
-    id1: int
-        Index of the second operand, or -1 when unused.
+    addr: tuple[int, ...]
+        Buffer dependencies used by this operation.
     opcode: int
         Operation code. See docs/alir.md for the opcode table.
-    data: int
-        Opcode-specific integer payload.
+    data: tuple[int, ...]
+        Opcode-specific integer payload. For opcode -1 this stores the input
+        index, because inputs are not buffer dependencies.
     qint: QInterval
         Quantization interval of the produced buffer element.
     latency: float
@@ -66,28 +66,16 @@ class Op(NamedTuple):
         Estimated cost of the operation.
     """
 
-    id0: int
-    id1: int
+    addr: tuple[int, ...]
     opcode: int
-    data: int
+    data: tuple[int, ...]
     qint: QInterval
     latency: float
     cost: float
 
     @property
     def input_ids(self) -> tuple[int, ...]:
-        if self.opcode == -1:
-            return ()
-        if self.opcode == 6:
-            k = self.data & 0xFFFFFFFF
-            return (self.id0, self.id1, k)
-        if self.opcode in (0, 1, 7, 10):  # add, sub, mul, bin bitops
-            return (self.id0, self.id1)
-        if self.opcode in (-2, 2, 3, 4, 6, 8, 9):  # neg, relu, quantize, const add, mux, lookup, unary bitops
-            return (self.id0,)
-        if self.opcode == 5:  # const definition
-            return ()
-        raise ValueError(f'Unknown opcode {self.opcode} in {self}')
+        return self.addr
 
 
 class Pair(NamedTuple):
@@ -164,6 +152,14 @@ class JSONEncoder(json.JSONEncoder):
         super().default(o)
 
 
+def _iter_sum_terms(op: Op):
+    assert op.opcode == 11
+    assert len(op.addr) >= 2
+    assert len(op.data) >= 2 * len(op.addr)
+    for i, addr in enumerate(op.addr):
+        yield addr, bool(op.data[2 * i]), op.data[2 * i + 1]
+
+
 class CombLogic(NamedTuple):
     """ALIR combinational program.
 
@@ -227,38 +223,43 @@ class CombLogic(NamedTuple):
                 op = self.ops[i]
                 match op.opcode:
                     case -2:
-                        op_str = f'-buf[{op.id0}]'
+                        op_str = f'-buf[{op.addr[0]}]'
                     case -1:
-                        op_str = f'inp[{op.id0}]'
+                        op_str = f'inp[{op.data[0]}]'
                     case 0 | 1:
                         _sign = '-' if op.opcode == 1 else '+'
-                        op_str = f'buf[{op.id0}] {_sign} buf[{op.id1}]<<{op.data}'
+                        op_str = f'buf[{op.addr[0]}] {_sign} buf[{op.addr[1]}]<<{op.data[0]}'
+                    case 11:
+                        parts = []
+                        for addr, plus, shift in _iter_sum_terms(op):
+                            term = f'buf[{addr}]' if shift == 0 else f'buf[{addr}]<<{shift}'
+                            if parts:
+                                parts.append(f'{"+" if plus else "-"} {term}')
+                            else:
+                                parts.append(term if plus else f'-{term}')
+                        op_str = ' '.join(parts)
                     case 2:
-                        op_str = f'relu(buf[{op.id0}])'
+                        op_str = f'relu(buf[{op.addr[0]}])'
                     case 3:
-                        op_str = f'quantize(buf[{op.id0}])'
+                        op_str = f'quantize(buf[{op.addr[0]}])'
                     case 4:
-                        shift = (((op.data >> 32) & 0xFFFFFFFF) + (1 << 31)) % (1 << 32) - (1 << 31)
-                        data = (((op.data) & 0xFFFFFFFF) + (1 << 31)) % (1 << 32) - (1 << 31)
-                        val = data * 2**-shift
-                        op_str = f'buf[{op.id0}] + {val}'
+                        val = op.data[0] * 2 ** -op.data[1]
+                        op_str = f'buf[{op.addr[0]}] + {val}'
                     case 5:
-                        op_str = f'const {op.data * op.qint.step}'
+                        op_str = f'const {op.data[0] * op.qint.step}'
                     case 6:
-                        shift = (((op.data >> 32) & 0xFFFFFFFF) + (1 << 31)) % (1 << 32) - (1 << 31)
-                        op_str = f'msb(buf[{op.data & 0xFFFFFFFF}]) ? buf[{op.id0}] : buf[{op.id1}] << {shift}'
+                        op_str = f'msb(buf[{op.addr[2]}]) ? buf[{op.addr[0]}] : buf[{op.addr[1]}] << {op.data[0]}'
                     case 7:
-                        op_str = f'buf[{op.id0}] * buf[{op.id1}]'
+                        op_str = f'buf[{op.addr[0]}] * buf[{op.addr[1]}]'
                     case 8:
-                        op_str = f'tables[{int(op.data)}].lookup(buf[{op.id0}])'
+                        op_str = f'tables[{op.data[0]}].lookup(buf[{op.addr[0]}])'
                     case 9:
-                        op_symbol = {0: '~', 1: 'any*', 2: 'all*'}[op.data]
-                        op_str = f'{op_symbol}(buf[{op.id0}])'
+                        op_symbol = {0: '~', 1: 'any*', 2: 'all*'}[op.data[0]]
+                        op_str = f'{op_symbol}(buf[{op.addr[0]}])'
                     case 10:
-                        _opcode = (op.data >> 56) & 0xFF
+                        shift, _opcode = op.data
                         op_symbol = {0: '&', 1: '|', 2: '^'}[_opcode]
-                        shift = ((int(op.data) & 0xFFFFFFFF) + (1 << 31)) % (1 << 32) - (1 << 31)
-                        op_str = f'buf[{op.id0}] {op_symbol} buf[{op.id1}] << {shift}'
+                        op_str = f'buf[{op.addr[0]}] {op_symbol} buf[{op.addr[1]}] << {shift}'
                     case _:
                         raise ValueError(f'Unknown opcode {op.opcode} in {op}')
 
@@ -281,31 +282,34 @@ class CombLogic(NamedTuple):
 
         match op.opcode:
             case -2:  # neg
-                ret = -buf[op.id0]
+                ret = -buf[op.addr[0]]
             case -1:  # copy from external buffer
-                ret = inp[op.id0]
+                ret = inp[op.data[0]]
             case 0 | 1:  # addition
-                v0, v1 = buf[op.id0], 2.0**op.data * buf[op.id1]
+                v0, v1 = buf[op.addr[0]], 2.0 ** op.data[0] * buf[op.addr[1]]
                 ret = v0 + v1 if op.opcode == 0 else v0 - v1
+            case 11:  # signed shifted sum
+                ret = 0
+                for addr, plus, shift in _iter_sum_terms(op):
+                    term = 2.0**shift * buf[addr]
+                    ret = ret + term if plus else ret - term
             case 2:  # relu(+/-x)
-                v = buf[op.id0]
+                v = buf[op.addr[0]]
                 _, _i, _f = op.qint.kif
                 ret = _relu(v, _i, _f, round_mode='TRN')
             case 3:  # quantize(+/-x)
-                v = buf[op.id0] if op.opcode == 3 else -buf[op.id0]
+                v = buf[op.addr[0]]
                 _k, _i, _f = op.qint.kif
                 ret = _quantize(v, _k, _i, _f, round_mode='TRN')
             case 4:  # const addition
-                shift = (((op.data >> 32) & 0xFFFFFFFF) + (1 << 31)) % (1 << 32) - (1 << 31)
-                data = (((op.data) & 0xFFFFFFFF) + (1 << 31)) % (1 << 32) - (1 << 31)
-                val = data * 2**-shift
-                ret = buf[op.id0] + val
+                val = op.data[0] * 2 ** -op.data[1]
+                ret = buf[op.addr[0]] + val
             case 5:  # const definition
-                ret = op.data * op.qint.step  # const definition
+                ret = op.data[0] * op.qint.step
             case 6:  # MSB Mux
-                id_c = op.data & 0xFFFFFFFF
-                k, v0, v1 = buf[id_c], buf[op.id0], buf[op.id1]
-                shift = (((op.data >> 32) & 0xFFFFFFFF) + (1 << 31)) % (1 << 32) - (1 << 31)
+                id_true, id_false, id_c = op.addr
+                k, v0, v1 = buf[id_c], buf[id_true], buf[id_false]
+                shift = op.data[0]
 
                 if isinstance(k, FVariable):
                     ret = k.msb_mux(v0, v1 * 2**shift, op.qint)  # type: ignore
@@ -318,27 +322,24 @@ class CombLogic(NamedTuple):
                         ret = v0 if k >= 2.0 ** (_i - 1) else v1 * 2.0**shift
                     ret = _quantize(ret, *op.qint.kif, round_mode='TRN')
             case 7:  # multiplication
-                v0, v1 = buf[op.id0], buf[op.id1]
+                v0, v1 = buf[op.addr[0]], buf[op.addr[1]]
                 ret = v0 * v1
             case 8:  # lookup table
-                v0 = buf[op.id0]
+                v0 = buf[op.addr[0]]
                 tables = self.lookup_tables
                 assert tables is not None, 'No lookup table provided for lookup operation'
-                table = tables[op.data]
-                ret = table.lookup(v0, self.ops[op.id0].qint)
+                table = tables[op.data[0]]
+                ret = table.lookup(v0, self.ops[op.addr[0]].qint)
             case 9:  # Unary bitwise operation
-                v0 = buf[op.id0]
-                ret = unary_bit_op(v0 if op.opcode == 9 else -v0, op.data, self.ops[op.id0].qint, op.qint)
+                v0 = buf[op.addr[0]]
+                ret = unary_bit_op(v0, op.data[0], self.ops[op.addr[0]].qint, op.qint)
             case 10:  # Binary bitwise operation
-                v0, v1 = buf[op.id0], buf[op.id1]
-                inv0, inv1 = (op.data >> 32) & 1, (op.data >> 33) & 1
-                v0, v1 = (-v0 if inv0 else v0), (-v1 if inv1 else v1)
-                shift = ((op.data & 0xFFFFFFFF) + (1 << 31)) % (1 << 32) - (1 << 31)
-                _opcode = (op.data >> 56) & 0xFF
-                _qint1 = self.ops[op.id1].qint
+                v0, v1 = buf[op.addr[0]], buf[op.addr[1]]
+                shift, _opcode = op.data
+                _qint1 = self.ops[op.addr[1]].qint
                 s = 2.0**shift
                 qint1 = QInterval(_qint1.min * s, _qint1.max * s, _qint1.step * s)
-                ret = binary_bit_op(v0, v1 * s, _opcode, self.ops[op.id0].qint, qint1, op.qint)
+                ret = binary_bit_op(v0, v1 * s, _opcode, self.ops[op.addr[0]].qint, qint1, op.qint)
             case _:
                 raise ValueError(f'Unknown opcode {op.opcode} in {op}')
         return ret
@@ -405,7 +406,7 @@ class CombLogic(NamedTuple):
         for op in self.ops:
             if op.opcode != -1:
                 continue
-            qints[op.id0] = op.qint
+            qints[op.data[0]] = op.qint
         return qints
 
     @property
@@ -430,15 +431,18 @@ class CombLogic(NamedTuple):
 
         if not raw:
             assert dump['meta'] in ('ALIRModel', 'DAISModel'), f'Unknown model type {dump["meta"]}'
-            assert dump['spec_version'] == ALIR_SPEC_VERSION, (
-                f'Unsupported spec version {dump["spec_version"]}: expected {ALIR_SPEC_VERSION}'
-            )
+            dump = cls.upgrade_dict(dump)
 
         data = dump['model'] if not raw else dump
 
         ops = []
         for _op in data[5]:
-            op = Op(*_op[:4], QInterval(*_op[4]), *_op[5:])  # type: ignore
+            addr, opcode, payload, qint, latency, cost = _op
+            payload = tuple(int(v) for v in payload)
+            for value in payload:
+                if value < -(1 << 63) or value >= (1 << 63):
+                    raise ValueError(f'ALIR v3 op data value outside int64 range: {value}')
+            op = Op(tuple(int(v) for v in addr), int(opcode), payload, QInterval(*qint), latency, cost)
             ops.append(op)
         assert len(data) in (8, 9), f'{len(data)}'
         lookup_tables = data[8] if len(data) > 8 else None
@@ -458,6 +462,27 @@ class CombLogic(NamedTuple):
             lookup_tables=lookup_tables,
         )
 
+    @staticmethod
+    def upgrade_dict(dump: dict) -> dict:
+        """Return a v3 ALIR JSON dictionary converted from a v2 dictionary."""
+        from ._compat import _op_from_v2_record
+
+        spec_version = dump.get('spec_version')
+        if spec_version == ALIR_SPEC_VERSION:
+            return dump
+        if dump.get('meta') not in ('ALIRModel', 'DAISModel'):
+            raise ValueError(f'Unknown model type {dump.get("meta")}')
+
+        match spec_version:
+            case 2:
+                data = list(dump['model'])
+                data[5] = [_op_from_v2_record(op) for op in data[5]]
+                return {'model': data, 'meta': 'ALIRModel', 'spec_version': ALIR_SPEC_VERSION}
+            case _:
+                raise ValueError(
+                    f'Cannot handle ALIR spec version {spec_version}; current version: {ALIR_SPEC_VERSION}, competible upgrade versions: 2'
+                )
+
     @classmethod
     def load(cls, path: str | Path):
         """Load from a JSON file; accepts gzip (detected by magic bytes)."""
@@ -475,75 +500,70 @@ class CombLogic(NamedTuple):
         """The number of references to the output elements in the solution."""
         ref_count = np.zeros(len(self.ops), dtype=np.uint64)
         for op in self.ops:
-            if op.opcode == -1:
-                continue
-            id0, id1 = op.id0, op.id1
-            if id0 != -1:
-                ref_count[id0] += 1
-            if id1 != -1:
-                ref_count[id1] += 1
-            if op.opcode in (6, -6):
-                # msb_mux operation
-                ref_count[op.data & 0xFFFFFFFF] += 1
+            for idx in op.input_ids:
+                ref_count[idx] += 1
         for i in self.out_idxs:
             if i < 0:
                 continue
             ref_count[i] += 1
         return ref_count
 
-    def to_bytecode(self, version: int = 0) -> NDArray[np.int32]:
-        """Return the int32 bytecode array consumed by the C++ ALIR interpreter."""
+    def to_bytecode(self) -> bytes:
+        """Return the raw bytecode consumed by the C++ ALIR interpreter."""
         n_in, n_out = self.shape
-        header_size_i32 = 6 + n_in + n_out * 3
         n_ops = len(self.ops)
         n_tables = len(self.lookup_tables) if self.lookup_tables is not None else 0
 
-        header = np.concatenate(
-            [
-                [ALIR_SPEC_VERSION, version, n_in, n_out, n_ops, n_tables],
-                self.inp_shifts,
-                self.out_idxs,
-                self.out_shifts,
-                self.out_negs,
-            ],
-            axis=0,
-            dtype=np.int32,
-        )
-        assert len(header) == header_size_i32, f'Header size mismatch: {len(header)} != {header_size_i32}'
+        data = bytearray()
+        data.extend(struct.pack('<4sIIIII', ALIR_BYTECODE_MAGIC, ALIR_SPEC_VERSION, n_in, n_out, n_ops, n_tables))
+        data.extend(struct.pack(f'<{n_in}i', *self.inp_shifts) if n_in else b'')
+        data.extend(struct.pack(f'<{n_out}i', *self.out_idxs) if n_out else b'')
+        data.extend(struct.pack(f'<{n_out}i', *self.out_shifts) if n_out else b'')
+        data.extend(struct.pack(f'<{n_out}B', *(1 if v else 0 for v in self.out_negs)) if n_out else b'')
 
-        code = np.empty((n_ops, 8), dtype=np.int32)
-        if n_ops > 0:
-            id0s, id1s, opcodes, datas, qints, _lats, _costs = zip(*self.ops)
-            code[:, 0] = np.asarray(opcodes, dtype=np.int32)
-            code[:, 1] = np.asarray(id0s, dtype=np.int32)
-            code[:, 2] = np.asarray(id1s, dtype=np.int32)
-            datas_u64 = np.asarray([d & 0xFFFFFFFFFFFFFFFF for d in datas], dtype=np.uint64)
-            code[:, 3:5] = datas_u64.view(np.int32).reshape(n_ops, 2)
-            qmins, qmaxs, qsteps = zip(*qints)
-            qmins = np.asarray(qmins, dtype=np.float64)
-            qmaxs = np.asarray(qmaxs, dtype=np.float64)
-            qsteps = np.asarray(qsteps, dtype=np.float64)
-            code[:, 5:] = minimal_kif_batch(qmins, qmaxs, qsteps)
+        for i, op in enumerate(self.ops):
+            if len(op.addr) > 0xFFFF:
+                raise ValueError(f'Operation {i} has too many addresses for bytecode: {len(op.addr)}')
+            payload = list(op.data)
+            if op.opcode == 8:
+                if self.lookup_tables is None:
+                    raise ValueError('Lookup op requires lookup_tables for bytecode emission')
+                table_idx = op.data[0]
+                if table_idx < 0 or table_idx >= len(self.lookup_tables):
+                    raise ValueError(f'Operation {i} has out-of-range lookup table index {table_idx}')
+                payload = [table_idx, self.lookup_tables[table_idx]._get_pads(self.ops[op.addr[0]].qint)[0], *op.data[1:]]
+            if len(payload) > 0xFFFF:
+                raise ValueError(f'Operation {i} has too many data entries for bytecode: {len(payload)}')
+            for addr in op.addr:
+                if addr < 0 or addr > 0xFFFFFFFF:
+                    raise ValueError(f'Operation {i} has out-of-range address {addr}')
+            for value in payload:
+                if value < -(1 << 63) or value >= (1 << 63):
+                    raise ValueError(f'Operation {i} has data value outside int64 range: {value}')
+            signed, integers, fractionals = op.qint.kif
+            if integers < -0x80 or integers > 0x7F or fractionals < -0x80 or fractionals > 0x7F:
+                raise ValueError(f'Operation {i} KIF exceeds bytecode one-byte fields: {op.qint.kif}')
+            data.extend(
+                struct.pack(
+                    '<bBBBHH',
+                    op.opcode,
+                    int(signed),
+                    integers & 0xFF,
+                    fractionals & 0xFF,
+                    len(op.addr),
+                    len(payload),
+                )
+            )
+            data.extend(struct.pack(f'<{len(op.addr)}I', *op.addr) if op.addr else b'')
+            data.extend(struct.pack(f'<{len(payload)}q', *payload) if payload else b'')
 
-            if self.lookup_tables is not None:
-                idx8 = np.flatnonzero(code[:, 0] == 8)
-                for j in idx8:
-                    j_int = int(j)
-                    op = self.ops[j_int]
-                    pad_left = self.lookup_tables[op.data]._get_pads(self.ops[op.id0].qint)[0]
-                    val = ((pad_left << 32) | (op.data & 0xFFFFFFFF)) & 0xFFFFFFFFFFFFFFFF
-                    code[j_int, 3:5].view(np.uint64)[:] = val
+        if self.lookup_tables is not None:
+            for table in self.lookup_tables:
+                values = np.asarray(table.table, dtype=np.int32)
+                data.extend(struct.pack('<I', len(values)))
+                data.extend(values.astype('<i4', copy=False).tobytes())
 
-        data = np.concatenate([header, code.reshape(-1)])
-
-        if self.lookup_tables is None:
-            return data
-
-        tables = [table.table for table in self.lookup_tables]
-        table_sizes = [len(tab) for tab in tables]
-        table_data = np.concatenate([table_sizes] + tables, axis=0, dtype=np.int32)
-        data = np.concatenate([data, table_data])
-        return data
+        return bytes(data)
 
     def predict(self, data: NDArray | Sequence[NDArray], n_threads: int = 0, debug=False, dump=False) -> NDArray[np.float64]:
         """Predict a batch with the C++ ALIR interpreter.

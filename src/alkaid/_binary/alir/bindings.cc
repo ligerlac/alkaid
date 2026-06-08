@@ -3,9 +3,12 @@
 #include <nanobind/stl/string.h>
 #include "ALIRInterpreter.hh"
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <vector>
 #include <omp.h>
@@ -83,8 +86,56 @@ static void _run_dump(
 
 // Return cache size in bytes, or 0 if unknown (non-Linux/macOS,
 // aarch64 Linux, musl, etc.).
+#if defined(__linux__)
+static std::string read_small_file(const char *path) {
+    std::ifstream f(path);
+    std::string s;
+    std::getline(f, s);
+    return s;
+}
+
+static size_t parse_sysfs_cache_size(const std::string &s) {
+    size_t i = 0;
+    while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i])))
+        ++i;
+    if (i == 0)
+        return 0;
+    size_t v = std::stoull(s.substr(0, i));
+    while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i])))
+        ++i;
+    if (i < s.size()) {
+        if (s[i] == 'K' || s[i] == 'k')
+            v *= 1024;
+        else if (s[i] == 'M' || s[i] == 'm')
+            v *= 1024 * 1024;
+    }
+    return v;
+}
+
+static size_t probe_linux_cache_level(int level) {
+    char path[128];
+    for (int i = 0; i < 16; ++i) {
+        std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu0/cache/index%d/level", i);
+        const std::string lvl = read_small_file(path);
+        if (lvl.empty() || std::atoi(lvl.c_str()) != level)
+            continue;
+        std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu0/cache/index%d/type", i);
+        const std::string type = read_small_file(path);
+        if (type != "Unified" && type != "Data")
+            continue;
+        std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu0/cache/index%d/size", i);
+        const size_t size = parse_sysfs_cache_size(read_small_file(path));
+        if (size > 0)
+            return size;
+    }
+    return 0;
+}
+#endif
+
 static size_t probe_l2_cache_per_core() {
 #if defined(__linux__) && defined(_SC_LEVEL2_CACHE_SIZE)
+    if (const size_t sysfs_l2 = probe_linux_cache_level(2); sysfs_l2 > 0)
+        return sysfs_l2;
     long r = sysconf(_SC_LEVEL2_CACHE_SIZE);
     return r > 0 ? (size_t)r : 0;
 #elif defined(__APPLE__)
@@ -104,6 +155,8 @@ static size_t probe_l2_cache_per_core() {
 
 static size_t probe_l3_cache() {
 #if defined(__linux__) && defined(_SC_LEVEL3_CACHE_SIZE)
+    if (const size_t sysfs_l3 = probe_linux_cache_level(3); sysfs_l3 > 0)
+        return sysfs_l3;
     long r = sysconf(_SC_LEVEL3_CACHE_SIZE);
     return r > 0 ? (size_t)r : 0;
 #elif defined(__APPLE__)
@@ -225,23 +278,17 @@ static void run_interp_loaded(
 }
 
 static nb::ndarray<nb::numpy, double> run_interp_numpy(
-    const nb::ndarray<int32_t> &bin_logic,
+    const nb::bytes &bin_logic,
     const nb::ndarray<nb::numpy, double> &input,
     int64_t n_threads,
     bool dump
 ) {
-    const int32_t *bin_logic_ptr = bin_logic.data();
-    if (bin_logic.size() < 5)
+    const uint8_t *bin_logic_ptr = reinterpret_cast<const uint8_t *>(bin_logic.data());
+    if (bin_logic.size() < 24)
         throw std::runtime_error("Invalid binary logic data");
-    if (bin_logic_ptr[0] != alir::ALIRInterpreter::alir_version) {
-        throw std::runtime_error(
-            "ALIR version mismatch: expected version " + std::to_string(alir::ALIRInterpreter::alir_version) +
-            ", got version " + std::to_string(bin_logic_ptr[0])
-        );
-    }
 
     alir::ALIRInterpreter interp;
-    interp.load_from_bytecode(std::span<const int32_t>(bin_logic_ptr, bin_logic.size()));
+    interp.load_from_bytecode(std::span<const uint8_t>(bin_logic_ptr, bin_logic.size()));
 
     const size_t n_samples = input.size() / interp.get_n_in();
     const size_t n_out = dump ? interp.get_n_ops() : interp.get_n_out();

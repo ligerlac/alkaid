@@ -10,10 +10,10 @@ from ....types import CombLogic, Op
 def gen_memfile(sol: CombLogic, op: Op) -> str:
     assert op.opcode == 8
     assert sol.lookup_tables is not None
-    table = sol.lookup_tables[op.data]
+    table = sol.lookup_tables[op.data[0]]
     width = sum(table.spec.out_kif)
     ndigits = ceil(width / 4)
-    data = table.padded_table(sol.ops[op.id0].qint)
+    data = table.padded_table(sol.ops[op.addr[0]].qint)
     mem_lines = []
     for v in data:
         if np.isnan(v):
@@ -55,45 +55,51 @@ def ssa_gen(sol: CombLogic, neg_repo: dict[int, tuple[int, str]], print_latency:
 
         match op.opcode:
             case -2:  # Negation
-                bw0, v0 = widths[op.id0], f'v{op.id0}'
-                is_signed = int(ops[op.id0].qint.min < 0)
+                a = op.addr[0]
+                bw0, v0 = widths[a], f'v{a}'
+                is_signed = int(ops[a].qint.min < 0)
                 line = f'{_def} negative #({bw0}, {bw}, {is_signed}) op_{i} ({v0}, {v});'
 
             case -1:  # Input marker
-                i0, i1 = inp_idxs[op.id0]
+                i0, i1 = inp_idxs[op.data[0]]
                 line = f'{_def} assign {v} = model_inp[{i0}:{i1}];'
 
-            case 0 | 1:  # Common a+/-b<<shift oprs
-                p0, p1 = kifs[op.id0], kifs[op.id1]  # precision -> keep_neg, integers (no sign), fractional
+            case 0 | 1:  # Common binary a+/-b<<shift oprs
+                assert len(op.addr) == 2 and len(op.data) == 1
+                a, b = op.addr
+                data_shift = op.data[0]
+                p0, p1 = kifs[a], kifs[b]  # precision -> keep_neg, integers (no sign), fractional
 
-                bw0, bw1 = widths[op.id0], widths[op.id1]  # width
+                bw0, bw1 = widths[a], widths[b]  # width
                 s0, f0, s1, f1 = int(p0[0]), p0[2], int(p1[0]), p1[2]
-                shift = op.data + f0 - f1
-                v0, v1 = f'v{op.id0}[{bw0 - 1}:0]', f'v{op.id1}[{bw1 - 1}:0]'
-                dlsbs = max(f0, f1 - op.data) - kifs[i][2]
+                shift = data_shift + f0 - f1
+                v0, v1 = f'v{a}[{bw0 - 1}:0]', f'v{b}[{bw1 - 1}:0]'
+                dlsbs = max(f0, f1 - data_shift) - kifs[i][2]
 
                 line = f'{_def} shift_adder #({bw0},{bw1},{s0},{s1},{bw},{dlsbs},{shift},{op.opcode}) op_{i} ({v0},{v1},{v});'
 
             case 2:  # ReLU
-                lsb_bias = kifs[op.id0][2] - kifs[i][2]
+                a = op.addr[0]
+                lsb_bias = kifs[a][2] - kifs[i][2]
                 i0, i1 = bw + lsb_bias - 1, lsb_bias
 
-                v0_name = f'v{op.id0}'
-                bw0 = widths[op.id0]
+                v0_name = f'v{a}'
+                bw0 = widths[a]
 
-                if ops[op.id0].qint.min < 0:
+                if ops[a].qint.min < 0:
                     line = f'{_def} assign {v} = {v0_name}[{i0}:{i1}] & {{{bw}{{~{v0_name}[{bw0 - 1}]}}}};'
                 else:
                     line = f'{_def} assign {v} = {v0_name}[{i0}:{i1}];'
 
             case 3:  # Explicit quantization
-                lsb_bias = kifs[op.id0][2] - kifs[i][2]
+                a = op.addr[0]
+                lsb_bias = kifs[a][2] - kifs[i][2]
                 i0, i1 = bw + lsb_bias - 1, lsb_bias
-                v0_name = f'v{op.id0}'
-                bw0 = widths[op.id0]
+                v0_name = f'v{a}'
+                bw0 = widths[a]
 
                 if i0 >= bw0:
-                    assert ops[op.id0].qint.min < 0, f'{i}, {op.id0}'
+                    assert ops[a].qint.min < 0, f'{i}, {a}'
 
                     if i1 >= bw0:
                         v0_name = f'{{{i0 - i1 + 1}{{{v0_name}[{bw0 - 1}]}}}}'
@@ -104,34 +110,31 @@ def ssa_gen(sol: CombLogic, neg_repo: dict[int, tuple[int, str]], print_latency:
                     line = f'{_def} assign {v} = {v0_name}[{i0}:{i1}];'
 
             case 4:  # constant addition
-                val = ((op.data & 0xFFFFFFFF) + 0x80000000) % 0x100000000 - 0x80000000
-                f1 = (((op.data >> 32) & 0xFFFFFFFF) + 0x80000000) % 0x100000000 - 0x80000000
-                bw0, bw1 = widths[op.id0], ceil(log2(abs(val) + 1))
-                s0, _, f0 = kifs[op.id0]
+                a = op.addr[0]
+                val, f1 = op.data
+                bw0, bw1 = widths[a], ceil(log2(abs(val) + 1))
+                s0, _, f0 = kifs[a]
                 s0, s1 = int(s0), int(val < 0)
                 shift = f0 - f1
-                v0 = f'v{op.id0}[{bw0 - 1}:0]'
+                v0 = f'v{a}[{bw0 - 1}:0]'
                 v1 = f"{bw1}'{bin(abs(val))[1:]}"
                 dlsbs = max(f0, f1) - kifs[i][2]
 
                 line = f'{_def} shift_adder #({bw0},{bw1},{s0},0,{bw},{dlsbs},{shift},{s1}) op_{i} ({v0},{v1},{v});'
 
             case 5:  # constant
-                num = op.data
+                num = op.data[0]
                 if num < 0:
                     num = 2**bw + num
                 line = f"{_def} assign {v} = '{bin(num)[1:]};"
 
             case 6:  # MSB Muxing
-                k, a, b = op.data & 0xFFFFFFFF, op.id0, op.id1
+                a, b, k = op.addr
                 p0, p1 = kifs[a], kifs[b]
-                inv = '0'
                 bwk, bw0, bw1 = widths[k], widths[a], widths[b]
                 s0, f0, s1, f1 = int(p0[0]), p0[2], int(p1[0]), p1[2]
                 fo = kifs[i][2]
-                _shift = (op.data >> 32) & 0xFFFFFFFF
-                _shift = _shift if _shift < 0x80000000 else _shift - 0x100000000
-                shift1 = fo - f1 + _shift
+                shift1 = fo - f1 + op.data[0]
                 shift0 = fo - f0
                 assert shift0 == 0 or shift1 == 0, f'{i}, {op}, shift0={shift0}, shift1={shift1}'
                 shift = shift1 * (shift1 > 0) - shift0 * (shift0 > 0)
@@ -141,24 +144,26 @@ def ssa_gen(sol: CombLogic, neg_repo: dict[int, tuple[int, str]], print_latency:
                 if bw1 == 0:
                     v1, bw1 = "1'b0", 1
 
-                line = f'{_def} mux #({bw0},{bw1},{s0},{s1},{bw},{shift},{inv}) op_{i} ({vk},{v0},{v1},{v});'
+                line = f'{_def} mux #({bw0},{bw1},{s0},{s1},{bw},{shift}) op_{i} ({vk},{v0},{v1},{v});'
 
             case 7:  # Multiplication
-                bw0, bw1 = widths[op.id0], widths[op.id1]  # width
-                s0, s1 = int(kifs[op.id0][0]), int(kifs[op.id1][0])
-                v0, v1 = f'v{op.id0}[{bw0 - 1}:0]', f'v{op.id1}[{bw1 - 1}:0]'
+                a, b = op.addr
+                bw0, bw1 = widths[a], widths[b]  # width
+                s0, s1 = int(kifs[a][0]), int(kifs[b][0])
+                v0, v1 = f'v{a}[{bw0 - 1}:0]', f'v{b}[{bw1 - 1}:0]'
 
                 line = f'{_def} multiplier #({bw0},{bw1},{s0},{s1},{bw}) op_{i} ({v0},{v1},{v});'
 
             case 8:  # Lookup Table
                 name = get_table_name_memfile(sol, op)[0]
-                bw0 = widths[op.id0]
+                a = op.addr[0]
+                bw0 = widths[a]
 
-                line = f'{_def} lookup_table #({bw0},{bw},"{name}") op_{i} (v{op.id0}, {v});'
+                line = f'{_def} lookup_table #({bw0},{bw},"{name}") op_{i} (v{a}, {v});'
 
             case 9:  # Bitwise Unary
-                v0_name = f'v{op.id0}'
-                match op.data:
+                v0_name = f'v{op.addr[0]}'
+                match op.data[0]:
                     case 0:  # NOT
                         line = f'{_def} assign {v} = ~{v0_name};'
                     case 1:  # OR with self (reduction)
@@ -169,20 +174,22 @@ def ssa_gen(sol: CombLogic, neg_repo: dict[int, tuple[int, str]], print_latency:
                         raise ValueError(f'Unknown bitwise operation {op.data} for operation {i} ({op})')
 
             case 10:  # Bitwise Binary
-                # data: {subopcode[63:56], reserved[55:32], shift[31:0]}
-                data = op.data
-                subop, _shift = (data >> 56) & 0xFF, data & 0xFFFFFFFF
-                shift = (_shift + 0x80000000) % 0x100000000 - 0x80000000 + kifs[op.id0][2] - kifs[op.id1][2]
+                a, b = op.addr
+                data_shift, subop = op.data
+                shift = data_shift + kifs[a][2] - kifs[b][2]
 
-                bw0, v0_name = widths[op.id0], f'v{op.id0}'
-                s0 = ops[op.id0].qint.min < 0
+                bw0, v0_name = widths[a], f'v{a}'
+                s0 = ops[a].qint.min < 0
 
-                bw1, v1_name = widths[op.id1], f'v{op.id1}'
-                s1 = ops[op.id1].qint.min < 0
+                bw1, v1_name = widths[b], f'v{b}'
+                s1 = ops[b].qint.min < 0
 
                 s0, s1 = int(s0), int(s1)
 
                 line = f'{_def} binop #({bw0},{bw1},{s0},{s1},{bw},{shift},{subop}) op_{i} ({v0_name}, {v1_name}, {v});'
+
+            case 11:
+                raise ValueError(f'Verilog codegen does not support variadic opcode 11 for operation {i}: {op}')
 
             case _:
                 raise ValueError(f'Unknown opcode {op.opcode} for operation {i} ({op})')

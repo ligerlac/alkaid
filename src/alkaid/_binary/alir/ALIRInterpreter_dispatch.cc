@@ -5,23 +5,23 @@ namespace alir {
 
     template <int B>
     void ALIRInterpreter::exec_batch_core(const double *inputs, size_t batch_size, int64_t *buffer) const {
-        const OpExec *ops_ptr = ops_exec.data();
+        const Op *ops_ptr = ops.data();
         const double *scales_ptr = input_scales.data();
         const size_t nin = n_in;
 
         for (size_t i = 0; i < n_ops; ++i) {
-            const OpExec &op = ops_ptr[i];
+            const Op &op = ops_ptr[i];
 
             switch (op.h.opcode) {
             case -2: {
                 const auto &_op = op.neg;
-                op_neg<B>(buffer + (size_t)_op.h.out_addr * B, buffer + (size_t)_op.a0 * B);
+                op_neg<B>(buffer + (size_t)_op.h.addr_out * B, buffer + (size_t)_op.a0 * B);
                 break;
             }
             case -1: {
                 const auto &_op = op.input;
                 op_input<B>(
-                    buffer + (size_t)_op.h.out_addr * B,
+                    buffer + (size_t)_op.h.addr_out * B,
                     inputs,
                     nin,
                     _op.input_idx,
@@ -36,7 +36,7 @@ namespace alir {
             case 0: {
                 const auto &_op = op.add_sub;
                 op_shift_add<B, false>(
-                    buffer + (size_t)_op.h.out_addr * B,
+                    buffer + (size_t)_op.h.addr_out * B,
                     buffer + (size_t)_op.a0 * B,
                     buffer + (size_t)_op.a1 * B,
                     _op.actual_shift_v2,
@@ -47,7 +47,7 @@ namespace alir {
             case 1: {
                 const auto &_op = op.add_sub;
                 op_shift_add<B, true>(
-                    buffer + (size_t)_op.h.out_addr * B,
+                    buffer + (size_t)_op.h.addr_out * B,
                     buffer + (size_t)_op.a0 * B,
                     buffer + (size_t)_op.a1 * B,
                     _op.actual_shift_v2,
@@ -58,7 +58,7 @@ namespace alir {
             case 2: {
                 const auto &_op = op.reduce;
                 op_relu<B>(
-                    buffer + (size_t)_op.h.out_addr * B,
+                    buffer + (size_t)_op.h.addr_out * B,
                     buffer + (size_t)_op.a0 * B,
                     _op.reduce_shift,
                     mask_from(_op.h.w_out),
@@ -70,7 +70,7 @@ namespace alir {
             case 3: {
                 const auto &_op = op.reduce;
                 op_quantize<B>(
-                    buffer + (size_t)_op.h.out_addr * B,
+                    buffer + (size_t)_op.h.addr_out * B,
                     buffer + (size_t)_op.a0 * B,
                     _op.reduce_shift,
                     mask_from(_op.h.w_out),
@@ -82,7 +82,7 @@ namespace alir {
             case 4: {
                 const auto &_op = op.const_add;
                 op_const_add<B>(
-                    buffer + (size_t)_op.h.out_addr * B,
+                    buffer + (size_t)_op.h.addr_out * B,
                     buffer + (size_t)_op.a0 * B,
                     _op.actual_shift,
                     _op.global_shift,
@@ -92,13 +92,13 @@ namespace alir {
             }
             case 5: {
                 const auto &_op = op.constant;
-                op_const<B>(buffer + (size_t)_op.h.out_addr * B, _op.const_val);
+                op_const<B>(buffer + (size_t)_op.h.addr_out * B, _op.const_val);
                 break;
             }
             case 6: {
                 const auto &_op = op.mux;
                 op_msb_mux<B>(
-                    buffer + (size_t)_op.h.out_addr * B,
+                    buffer + (size_t)_op.h.addr_out * B,
                     buffer + (size_t)_op.a0 * B,
                     buffer + (size_t)_op.a1 * B,
                     buffer + (size_t)_op.cond * B,
@@ -114,7 +114,7 @@ namespace alir {
             case 7: {
                 const auto &_op = op.mul;
                 op_mul<B>(
-                    buffer + (size_t)_op.h.out_addr * B,
+                    buffer + (size_t)_op.h.addr_out * B,
                     buffer + (size_t)_op.a0 * B,
                     buffer + (size_t)_op.a1 * B
                 );
@@ -128,7 +128,7 @@ namespace alir {
                 const int64_t off = -sign + _op.data_high;
                 const auto &table = lookup_tables[_op.table_idx];
                 op_lookup<B>(
-                    buffer + (size_t)_op.h.out_addr * B,
+                    buffer + (size_t)_op.h.addr_out * B,
                     buffer + (size_t)_op.a0 * B,
                     table.data(),
                     (int64_t)table.size(),
@@ -139,7 +139,7 @@ namespace alir {
             case 9: {
                 const auto &_op = op.bit_un;
                 op_bit_unary<B>(
-                    buffer + (size_t)_op.h.out_addr * B,
+                    buffer + (size_t)_op.h.addr_out * B,
                     buffer + (size_t)_op.a0 * B,
                     _op.sub_op,
                     mask_from(_op.h.w_in),
@@ -150,12 +150,19 @@ namespace alir {
             case 10: {
                 const auto &_op = op.bit_bin;
                 op_bit_binary<B>(
-                    buffer + (size_t)_op.h.out_addr * B,
+                    buffer + (size_t)_op.h.addr_out * B,
                     buffer + (size_t)_op.a0 * B,
                     buffer + (size_t)_op.a1 * B,
                     _op.shl_a,
                     _op.shl_b,
                     _op.bit_op
+                );
+                break;
+            }
+            case 11: {
+                const auto &_op = op.sum;
+                op_sum<B>(
+                    buffer + (size_t)_op.h.addr_out * B, buffer, _op.terms, _op.n_terms, _op.global_shift
                 );
                 break;
             }
@@ -210,7 +217,7 @@ namespace alir {
 
         const size_t nops = n_ops;
         for (size_t i = 0; i < nops; ++i) {
-            const int64_t *slot = buffer + (size_t)op_out_addr[i] * B;
+            const int64_t *slot = buffer + (size_t)ops[i].h.addr_out * B;
             const double scale = op_dump_scales[i];
             for (size_t s = 0; s < batch_size; ++s) {
                 dump_outputs[s * nops + i] = static_cast<double>(slot[s]) * scale;

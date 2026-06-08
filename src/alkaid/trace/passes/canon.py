@@ -15,10 +15,10 @@ def const_propagation(comb: CombLogic) -> CombLogic:
             continue
         if all(ops[j].opcode == 5 for j in op.input_ids):
             # constant propagation
-            fake_buf = {j: ops[j].data * ops[j].qint.step for j in op.input_ids}
+            fake_buf = {j: ops[j].data[0] * ops[j].qint.step for j in op.input_ids}
             val: float = float(comb.exec_op(op, fake_buf, None))  # type: ignore
             step = 2.0 ** get_lsb_loc(val)
-            ops[i] = Op(-1, -1, 5, int(val / step), QInterval(val, val, step), op.latency, op.cost)
+            ops[i] = Op((), 5, (int(val / step),), QInterval(val, val, step), op.latency, op.cost)
     return CombLogic(
         comb.shape,
         comb.inp_shifts,
@@ -41,7 +41,7 @@ def canonicalize_outputs(comb: CombLogic) -> CombLogic:
         idx, s, n = comb.out_idxs[i], comb.out_shifts[i], comb.out_negs[i]
         if idx < 0:
             out_idxs[i] = len(ops)
-            ops.append(Op(-1, -1, 5, 0, QInterval(0.0, 0.0, 2.0**127), 0, 0))
+            ops.append(Op((), 5, (0,), QInterval(0.0, 0.0, 2.0**127), 0, 0))
             out_shifts[i] = 0
             out_negs[i] = False
             continue
@@ -49,10 +49,10 @@ def canonicalize_outputs(comb: CombLogic) -> CombLogic:
         op = comb.ops[idx]
         if ops[idx].opcode == 5:
             if s or n:
-                val = op.data * op.qint.step * 2**s * (-1 if n else 1)
+                val = op.data[0] * op.qint.step * 2**s * (-1 if n else 1)
                 out_idxs[i] = len(ops)
                 step = 2.0 ** get_lsb_loc(val)
-                op = Op(-1, -1, 5, int(val / step), QInterval(val, val, step), 0, 0)
+                op = Op((), 5, (int(val / step),), QInterval(val, val, step), 0, 0)
                 ops.append(op)
                 out_shifts[i] = 0
                 out_negs[i] = False
@@ -61,7 +61,7 @@ def canonicalize_outputs(comb: CombLogic) -> CombLogic:
         if n:
             out_idxs[i] = len(ops)
             qint = ops[idx].qint
-            ops.append(Op(idx, -1, -2, 0, QInterval(-qint.max, -qint.min, qint.step), op.latency, 0))
+            ops.append(Op((idx,), -2, (), QInterval(-qint.max, -qint.min, qint.step), op.latency, 0))
             out_negs[i] = False
 
     return CombLogic(

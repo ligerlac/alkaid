@@ -6,7 +6,7 @@ ALIR is alkaid's low-level static-dataflow representation. A `CombLogic` program
 The serialized JSON form written by `CombLogic.save()` is:
 
 - `meta`: the string `ALIRModel`.
-- `spec_version`: the ALIR spec version. The current version is `2`.
+- `spec_version`: the ALIR spec version. The current version is `3`.
 - `model`: the `CombLogic` payload described below.
 
 ## `CombLogic` Payload
@@ -25,80 +25,94 @@ The `model` payload is stored as an array in the same order as the `CombLogic` f
 
 Each operation record is stored in the same order as the `Op` fields:
 
-1. `id0`: first operand or input index.
-2. `id1`: second operand, or `-1` when unused.
-3. `opcode`: operation code. See the operation code table below.
-4. `data`: signed 64-bit integer payload whose meaning depends on the operation.
-5. `qint`: output quantization interval as `[min, max, step]`.
-6. `latency`: estimated availability time.
-7. `cost`: estimated operation cost.
+1. `addr`: buffer dependency indices.
+2. `opcode`: operation code. See the operation code table below.
+3. `data`: signed 64-bit integer payload tuple whose meaning depends on the operation.
+4. `qint`: output quantization interval as `[min, max, step]`.
+5. `latency`: estimated availability time.
+6. `cost`: estimated operation cost.
 
-Unused `id0` or `id1` fields must be `-1`. For non-input operations, operand indices must refer only to earlier operations. For opcode `6`, the condition index stored in `data_low` must also refer to an earlier operation.
+For non-input operations, every `addr` index must refer only to an earlier operation.
 
 ## Operation Codes
 
 - `-2`: Explicit negation.
-  - `buf[i] = -buf[id0]`
+  - `addr = (x,)`, `data = ()`.
+  - `buf[i] = -buf[x]`
 - `-1`: Copy from the external input buffer and quantize.
-  - `buf[i] = input[id0]`
+  - `addr = ()`, `data = (input_idx,)`.
+  - `buf[i] = input[input_idx]`
 - `0`: Addition.
-  - `buf[i] = buf[id0] + buf[id1] * 2^data`
+  - `addr = (a, b)`, `data = (shift,)`.
+  - `buf[i] = buf[a] + buf[b] * 2^shift`
 - `1`: Subtraction.
-  - `buf[i] = buf[id0] - buf[id1] * 2^data`
+  - `addr = (a, b)`, `data = (shift,)`.
+  - `buf[i] = buf[a] - buf[b] * 2^shift`
 - `2`: ReLU with output quantization.
-  - `buf[i] = quantize(relu(buf[id0]))`
+  - `addr = (x,)`, `data = ()`.
+  - `buf[i] = quantize(relu(buf[x]))`
 - `3`: Output quantization.
-  - `buf[i] = quantize(buf[id0])`
+  - `addr = (x,)`, `data = ()`.
+  - `buf[i] = quantize(buf[x])`
 - `4`: Add a constant.
-  - `data_low` is a signed integer payload, `data_high` is a signed shift, and the constant is `data_low * 2^-data_high`.
+  - `addr = (x,)`, `data = (value, shift)`.
+  - The constant is `value * 2^-shift`.
 - `5`: Define a constant.
-  - `buf[i] = data * qint.step`
+  - `addr = ()`, `data = (value,)`.
+  - `buf[i] = value * qint.step`
 - `6`: Mux by the most-significant bit of a condition value.
-  - `data_low` is the condition buffer index.
-  - `data_high` is the shift applied to `id1`.
-  - `buf[i] = MSB(buf[data_low]) ? buf[id0] : buf[id1] * 2^data_high`, then quantized to `qint`.
+  - `addr = (true_idx, false_idx, cond_idx)`, `data = (false_shift,)`.
+  - `buf[i] = MSB(buf[cond_idx]) ? buf[true_idx] : buf[false_idx] * 2^false_shift`, then quantized to `qint`.
 - `7`: Multiplication.
-  - `buf[i] = buf[id0] * buf[id1]`
+  - `addr = (a, b)`, `data = ()`.
+  - `buf[i] = buf[a] * buf[b]`
 - `8`: Logic lookup table.
-  - `data_low` is the lookup table index.
-  - In bytecode, `data_high` stores the table pad offset derived from the producer quantization interval.
+  - `addr = (x,)`, `data = (table_idx,)`.
+  - Bytecode appends an internal second data entry for the lookup pad offset derived from `x`'s quantization interval.
 - `9`: Unary bitwise operation.
-  - `data = 0`: bitwise NOT.
-  - `data = 1`: reduce-any.
-  - `data = 2`: reduce-all.
+  - `addr = (x,)`, `data = (subop,)`.
+  - `subop = 0`: bitwise NOT.
+  - `subop = 1`: reduce-any.
+  - `subop = 2`: reduce-all.
 - `10`: Binary bitwise operation.
-  - `data[31:0]` is the signed shift aligning operand 1 to operand 0.
-  - `data[55:32]` is reserved.
-  - `data[63:56]` is the sub-operation: `0` = AND, `1` = OR, `2` = XOR.
+  - `addr = (a, b)`, `data = (shift, subop)`.
+  - `subop = 0`: AND.
+  - `subop = 1`: OR.
+  - `subop = 2`: XOR.
+- `11`: Variadic signed shifted sum.
+  - `addr = (x0, x1, ..., xN)`, `data = (sign0, shift0, sign1, shift1, ..., signN, shiftN)`.
+  - `N >= 1`; each `signK` is `1` for `+` and `0` for `-`.
+  - `buf[i] = sum((+1 if signK else -1) * buf[xK] * 2^shiftK for K in range(N + 1))`
 
 Quantizing operations use direct fixed-point bit drop semantics: wrap for overflow and truncate for rounding.
 
 ## External Bytecode Representation
 
-`CombLogic.to_bytecode()` produces the int32 array consumed by the C++ ALIR interpreter. This is an in-memory interpreter format for python -> C++ communication, not a stable on-disk format. The bytecode is further converted to another internal bytecode format in the C++ interpreter for faster dispatch, which is not described here.
+`CombLogic.to_bytecode()` produces the raw byte string consumed by the C++ ALIR interpreter. This is an in-memory interpreter format for Python -> C++ communication, not a stable on-disk format. The bytecode is further converted to another internal bytecode format in the C++ interpreter for faster dispatch, which is not described here.
 
-The int32 array layout is:
+The bytecode is little-endian and laid out sequentially:
 
-1. Header: `[spec_version, firmware_version, n_inputs, n_outputs, n_ops, n_tables]`.
-2. `inp_shifts`: `int32[n_inputs]`.
-3. `out_idxs`: `int32[n_outputs]`.
-4. `out_shifts`: `int32[n_outputs]`.
-5. `out_negs`: `int32[n_outputs]`.
-6. `ops`: `int32[n_ops, 8]`.
-7. `table_sizes`: `int32[n_tables]`.
-8. `table_data`: concatenated `int32` lookup table contents.
+1. Header: `magic`, `spec_version`, `n_inputs`, `n_outputs`, `n_ops`, `n_tables`, encoded as `<4sIIIII>`. `magic` is `ALIR`.
+2. `inp_shifts`: `i32[n_inputs]`.
+3. `out_idxs`: `i32[n_outputs]`.
+4. `out_shifts`: `i32[n_outputs]`.
+5. `out_negs`: `u8[n_outputs]`.
+6. Per-operation records, each followed by its variable-length address and data arrays.
+7. Tables: for each table, `u32 table_size` followed by `i32[table_size]`.
 
-Each bytecode operation row is:
+Each bytecode operation record starts with:
 
-1. `opcode`: `int32`.
-2. `id0`: `int32`.
-3. `id1`: `int32`.
-4. `data_low`: low 32 bits of `data`.
-5. `data_high`: high 32 bits of `data`.
-6. `signed`: output signedness.
-7. `integers`: integer bits excluding the sign bit.
-8. `fractionals`: fractional bits.
+1. `opcode`: `i8`.
+2. `signed`: `u8`.
+3. `integers`: signed one-byte integer-bit count, excluding the sign bit.
+4. `fractionals`: signed one-byte fractional-bit count.
+5. `n_addr`: `u16`.
+6. `n_data`: `u16`.
+7. `addr`: `u32[n_addr]`.
+8. `data`: `i64[n_data]`.
 
-Lookup table data is stored in increasing lookup-index order. The bytecode loader validates the ALIR spec version, bytecode length, causality, and the interpreter's current 64-bit intermediate-width limit.
+For opcode `8`, bytecode contains the semantic lookup table index plus an internal second data entry containing the derived lookup pad offset. JSON remains semantic and stores only `(table_idx,)`.
 
-The JSON loader in the C++ interpreter accepts plain JSON and gzip-compressed JSON with the same `ALIRModel` wrapper used by `CombLogic.save()`.
+Lookup table data is stored in increasing lookup-index order. The bytecode loader validates the magic, ALIR spec version, bytecode length, generic address causality, ranges, EOF, and the interpreter's current 64-bit intermediate-width limit.
+
+The JSON loader in the C++ interpreter accepts v3 plain JSON and gzip-compressed JSON with the same `ALIRModel` wrapper used by `CombLogic.save()`. v2 files can be loaded in python, but C++ json loader only accepts v3. Use `alkaid convert v2.json[.gz] v3.json[.gz]` to convert on disk.

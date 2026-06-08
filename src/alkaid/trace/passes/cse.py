@@ -20,7 +20,7 @@ def to_key(op: Op):
     if op.opcode in (3, 4, 5):
         return tuple(op)
     else:
-        return op[:4]
+        return op[:3]
 
 
 def common_subexpr_elimin(comb: CombLogic) -> CombLogic:
@@ -38,7 +38,7 @@ def common_subexpr_elimin(comb: CombLogic) -> CombLogic:
         j = seen[k]
         qint0, qint1 = new_ops[i].qint, new_ops[j].qint
         qint = QInterval(max(qint0.min, qint1.min), min(qint0.max, qint1.max), max(qint0.step, qint1.step))
-        op = Op(op.id0, op.id1, op.opcode, op.data, qint, op.latency, op.cost)
+        op = Op(op.addr, op.opcode, op.data, qint, op.latency, op.cost)
         new_ops[j] = op
         redirect_all(used_in, new_ops, new_out_idxs, i, j)
 

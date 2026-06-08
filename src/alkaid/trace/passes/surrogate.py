@@ -30,13 +30,13 @@ def _is_const_descendent(idx: int, ops: list[Op], cache: dict[int, float]) -> fl
         cache[idx] = 1.0
         return 1.0
     if op.opcode == 10:  # bin bitops
-        return max(_is_const_descendent(op.id0, ops, cache), _is_const_descendent(op.id1, ops, cache))
+        return max(_is_const_descendent(op.addr[0], ops, cache), _is_const_descendent(op.addr[1], ops, cache))
     if op.opcode in (-2, 3, 9):  # NEG, wrap, unary bitops
-        res = _is_const_descendent(op.id0, ops, cache)
+        res = _is_const_descendent(op.addr[0], ops, cache)
         cache[idx] = res
         return res
     if op.opcode == 6:  # MUX
-        a, b = _is_const_descendent(op.id0, ops, cache), _is_const_descendent(op.id1, ops, cache)
+        a, b = _is_const_descendent(op.addr[0], ops, cache), _is_const_descendent(op.addr[1], ops, cache)
         res = 0.5 * (a + b)
         cache[idx] = res
         return res
@@ -172,12 +172,25 @@ def cost_lat_op(
         case -1:  # READ
             c, l = 0, 0
         case 0 | 1:  # +/-
-            op0, op1 = ops[op.id0], ops[op.id1]
+            op0, op1 = ops[op.addr[0]], ops[op.addr[1]]
             qint0, qint1 = op0.qint, op1.qint
-            shift1 = op.data
+            shift1 = op.data[0]
             c, l = cost_lat_add(qint0, qint1, shift1, n_add, n_carry)
+        case 11:
+            c, l = 0, 0
+            shift0 = op.data[1]
+            if len(op.addr) > 3:
+                for j in range(1, len(op.addr)):
+                    ci, li = cost_lat_add(ops[op.addr[0]].qint, ops[op.addr[j]].qint, op.data[2 * j + 1] - shift0, n_add, n_carry)
+                    c += ci
+                    l += li
+            else:
+                assert len(op.addr) == 3
+                c1, l1 = cost_lat_add(ops[op.addr[0]].qint, ops[op.addr[1]].qint, op.data[3] - shift0, n_add, n_carry)
+                c2, l2 = cost_lat_add(ops[op.addr[0]].qint, ops[op.addr[2]].qint, op.data[5] - shift0, n_add, n_carry)
+                c, l = max(c1, c2), max(l1, l2)
         case 2:  # relu(-)
-            qint_in = ops[op.id0].qint
+            qint_in = ops[op.addr[0]].qint
             if qint_in.min >= 0:
                 return 0, 0  # no-op for non-negative
             c, l = cost_relu(qint_in, LUT_X, LUT_Y)
@@ -186,7 +199,7 @@ def cost_lat_op(
         case 4:  # cadd: absorbed if consumer is not add/sub/mux
             eff_consumers = _cadd_consumer_width(idx, ops, used_in)
             if any(cop in (0, 1, 6) for cop in eff_consumers):
-                bw_in = sum(ops[op.id0].qint.kif)
+                bw_in = sum(ops[op.addr[0]].qint.kif)
                 return max(bw_in - 1, 0) * 0.30, 0
             return 0, 0
         case 5:  # const
@@ -196,18 +209,18 @@ def cost_lat_op(
             sf = _is_const_descendent(idx, ops, _cache)
             return out_bw * (0.5 - 0.36 * sf), 1.0
         case 7:  # mul
-            qint0, qint1 = ops[op.id0].qint, ops[op.id1].qint
+            qint0, qint1 = ops[op.addr[0]].qint, ops[op.addr[1]].qint
             c, l = cost_lat_mul(qint0, qint1, n_add, n_carry)
         case 8:  # lut
-            qint_in = ops[op.id0].qint
+            qint_in = ops[op.addr[0]].qint
             # qint_out = op.qint
             assert lut is not None
-            c, l = cost_lat_lut(qint_in, lut[op.data], LUT_X, LUT_Y)
+            c, l = cost_lat_lut(qint_in, lut[op.data[0]], LUT_X, LUT_Y)
         case 9:  # unary bitops: absorbed
             c, l = 0, 0
         case 10:  # bin bitops
-            qint0, qint1 = ops[op.id0].qint, ops[op.id1].qint
-            shift = ((int(op.data) & 0xFFFFFFFF) + (1 << 31)) % (1 << 32) - (1 << 31)
+            qint0, qint1 = ops[op.addr[0]].qint, ops[op.addr[1]].qint
+            shift = op.data[0]
             c, l = cost_lat_bin_bitops(qint0, qint1, shift, LUT_X, LUT_Y)
         case _:
             raise NotImplementedError(f'Unsupported opcode: {op.opcode}')
@@ -215,7 +228,7 @@ def cost_lat_op(
 
 
 def _with_cost_lat(op: Op, cost, lat) -> Op:
-    return Op(op.id0, op.id1, op.opcode, op.data, op.qint, lat, cost)
+    return Op(op.addr, op.opcode, op.data, op.qint, lat, cost)
 
 
 def add_surrogate(comb: CombLogic) -> CombLogic:

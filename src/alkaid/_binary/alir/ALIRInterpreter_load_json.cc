@@ -8,6 +8,7 @@
 #include <nlohmann/json.hpp>
 
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -18,24 +19,45 @@ namespace alir {
 
         using json = nlohmann::json;
 
-        // Op 5 can encode full 64-bit patterns, so accept uint64 too.
-        int64_t read_data_u64(const json &v) {
-            if (v.is_number_unsigned())
-                return static_cast<int64_t>(v.get<uint64_t>());
+        int64_t read_i64_json(const json &v) {
+            if (v.is_number_unsigned()) {
+                const uint64_t u = v.get<uint64_t>();
+                if (u > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+                    throw std::runtime_error("op.data is outside signed int64 range");
+                return static_cast<int64_t>(u);
+            }
             if (v.is_number_integer())
                 return v.get<int64_t>();
             throw std::runtime_error("op.data is not an integer");
         }
 
+        uint32_t read_addr_json(const json &v) {
+            if (v.is_number_unsigned()) {
+                const uint64_t addr = v.get<uint64_t>();
+                if (addr > std::numeric_limits<uint32_t>::max())
+                    throw std::runtime_error("op.addr is outside uint32 range");
+                return static_cast<uint32_t>(addr);
+            }
+            if (v.is_number_integer()) {
+                const int64_t addr = v.get<int64_t>();
+                if (addr < 0 || addr > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()))
+                    throw std::runtime_error("op.addr is outside uint32 range");
+                return static_cast<uint32_t>(addr);
+            }
+            throw std::runtime_error("op.addr is not an integer");
+        }
+
     } // anonymous namespace
 
     void ALIRInterpreter::load_from_json_string(std::string_view s) {
+        ops.clear();
         json doc = json::parse(s);
         if (!doc.contains("spec_version") || doc["spec_version"].get<int>() != alir_version) {
             throw std::runtime_error(
                 "ALIR JSON spec version mismatch: expected " + std::to_string(alir_version) + ", got " +
                 (doc.contains("spec_version") ? std::to_string(doc["spec_version"].get<int>())
-                                              : std::string("<missing>"))
+                                              : std::string("<missing>")) +
+                ". Run `alkaid upgrade INPUT OUTPUT` to convert v2 JSON first."
             );
         }
         if (!doc.contains("meta") || doc["meta"].get<std::string>() != "ALIRModel") {
@@ -75,7 +97,9 @@ namespace alir {
 
         const json &jops = m[5];
         n_ops = jops.size();
-        std::vector<Op> ops(n_ops);
+        std::vector<Op> program(n_ops);
+        std::vector<uint32_t> addr_pool;
+        std::vector<int64_t> data_pool;
 
         // qmin/qstep saved for opcode-8 pad_left fixup below (needs producer qint).
         std::vector<double> qmin(n_ops), qstep(n_ops);
@@ -83,11 +107,16 @@ namespace alir {
 
         for (size_t i = 0; i < n_ops; ++i) {
             const json &jo = jops[i];
-            const int32_t id0 = jo[0].get<int32_t>();
-            const int32_t id1 = jo[1].get<int32_t>();
-            const int32_t opcode = jo[2].get<int32_t>();
-            const int64_t data = read_data_u64(jo[3]);
-            const json &jq = jo[4];
+            if (!jo.is_array() || jo.size() != 6)
+                throw std::runtime_error(
+                    "ALIR JSON op " + std::to_string(i) + " is not a v3 length-6 record"
+                );
+            const json &addr = jo[0];
+            const int32_t opcode = jo[1].get<int32_t>();
+            const json &payload = jo[2];
+            if (!addr.is_array() || !payload.is_array())
+                throw std::runtime_error("ALIR JSON op addr/data fields must be arrays");
+            const json &jq = jo[3];
             const double qm_min = jq[0].get<double>();
             const double qm_max = jq[1].get<double>();
             const double qm_step = jq[2].get<double>();
@@ -97,13 +126,22 @@ namespace alir {
             qmin[i] = qm_min;
             qstep[i] = qm_step;
 
-            Op &op = ops[i];
+            if (addr.size() > std::numeric_limits<uint16_t>::max() ||
+                payload.size() > std::numeric_limits<uint16_t>::max())
+                throw std::runtime_error("ALIR JSON op has too many addr/data entries");
+
+            OpLoad &op = program[i].load;
+            op = OpLoad{};
             op.opcode = opcode;
-            op.id0 = id0;
-            op.id1 = id1;
-            op.data_low = static_cast<int32_t>(data & 0xFFFFFFFFll);
-            op.data_high = static_cast<int32_t>((data >> 32) & 0xFFFFFFFFll);
-            op.dtype = dtype;
+            op.addr_out = static_cast<uint32_t>(i);
+            op.addr_offset = static_cast<uint32_t>(addr_pool.size());
+            op.data_offset = static_cast<uint32_t>(data_pool.size());
+            op.n_addr = static_cast<uint16_t>(addr.size());
+            op.n_data = static_cast<uint16_t>(payload.size());
+            for (const json &v : addr)
+                addr_pool.push_back(read_addr_json(v));
+            for (const json &v : payload)
+                data_pool.push_back(read_i64_json(v));
         }
 
         lookup_tables.clear();
@@ -119,14 +157,26 @@ namespace alir {
             }
         }
 
-        // Opcode 8 packs pad_left (derived from the input op's qint) into data_high.
+        // Opcode 8 JSON is semantic; derive the internal lookup pad entry from the input op's qint.
         for (size_t i = 0; i < n_ops; ++i) {
-            Op &op = ops[i];
+            OpLoad &op = program[i].load;
             if (op.opcode != 8)
                 continue;
-            if (op.id0 < 0 || (size_t)op.id0 >= n_ops)
-                throw std::runtime_error("op " + std::to_string(i) + " (opcode 8) has invalid id0");
-            op.data_high = table_pad_left(qmin[op.id0], qstep[op.id0], dtypes[op.id0]);
+            if (op.n_addr == 0 || addr_pool[op.addr_offset] >= n_ops)
+                throw std::runtime_error("op " + std::to_string(i) + " (opcode 8) has invalid input address");
+            if (op.n_data == 0)
+                throw std::runtime_error("op " + std::to_string(i) + " (opcode 8) has no lookup table index");
+            if (op.n_data == std::numeric_limits<uint16_t>::max())
+                throw std::runtime_error("op " + std::to_string(i) + " (opcode 8) has too many data entries");
+            const uint32_t old_offset = op.data_offset;
+            const uint16_t old_n = op.n_data;
+            const uint32_t producer = addr_pool[op.addr_offset];
+            op.data_offset = static_cast<uint32_t>(data_pool.size());
+            op.n_data = old_n + 1;
+            data_pool.push_back(data_pool[old_offset]);
+            data_pool.push_back(table_pad_left(qmin[producer], qstep[producer], dtypes[producer]));
+            for (uint16_t j = 1; j < old_n; ++j)
+                data_pool.push_back(data_pool[old_offset + j]);
         }
 
         n_tables = lookup_tables.size();
@@ -136,9 +186,9 @@ namespace alir {
         max_out_width = 0;
         bits_in = 0;
         bits_out = 0;
-        for (const Op &op : ops) {
-            int32_t width = op.dtype.width();
-            if (op.opcode == -1) {
+        for (size_t i = 0; i < n_ops; ++i) {
+            int32_t width = dtypes[i].width();
+            if (program[i].load.opcode == -1) {
                 max_inp_width = std::max(max_inp_width, width);
                 bits_in += width;
             }
@@ -146,27 +196,25 @@ namespace alir {
         }
         for (int32_t idx : out_idxs) {
             if (idx >= 0) {
-                int32_t width = ops[idx].dtype.width();
+                int32_t width = dtypes[idx].width();
                 max_out_width = std::max(max_out_width, width);
                 bits_out += width;
             }
         }
         for (size_t i = 0; i < n_ops; ++i) {
-            const Op &op = ops[i];
-            if (op.opcode != -1 && op.id0 >= (int32_t)i)
+            const OpLoad &op = program[i].load;
+            for (uint16_t j = 0; j < op.n_addr; ++j) {
+                const uint32_t addr = addr_pool[op.addr_offset + j];
+                if (addr >= i)
+                    throw std::runtime_error(
+                        "Operation " + std::to_string(i) + " has address " + std::to_string(addr) +
+                        " violating causality"
+                    );
+            }
+            if (op.opcode == 8 && (op.n_data == 0 || data_pool[op.data_offset] < 0 ||
+                                   data_pool[op.data_offset] >= static_cast<int64_t>(n_tables)))
                 throw std::runtime_error(
-                    "Operation " + std::to_string(i) + " has id0=" + std::to_string(op.id0) +
-                    " violating causality"
-                );
-            if (op.id1 >= (int32_t)i)
-                throw std::runtime_error(
-                    "Operation " + std::to_string(i) + " has id1=" + std::to_string(op.id1) +
-                    " violating causality"
-                );
-            if (op.opcode == 6 && (size_t)op.data_low >= i)
-                throw std::runtime_error(
-                    "Operation " + std::to_string(i) + " has cond_idx=" + std::to_string(op.data_low) +
-                    " violating causality"
+                    "Operation " + std::to_string(i) + " has out-of-range lookup table index"
                 );
         }
         if (max_ops_width > 64) {
@@ -176,7 +224,7 @@ namespace alir {
             );
         }
 
-        build_exec_program(ops);
+        build_exec_program(std::move(program), addr_pool, data_pool, dtypes);
     }
 
     void ALIRInterpreter::load_from_json_file(const std::string &path) {

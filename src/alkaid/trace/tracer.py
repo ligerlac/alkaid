@@ -74,9 +74,9 @@ def _trace(inputs: Sequence[FVariable], outputs: Sequence[FVariable]):
         index[v.id] = ii
         if v.id in inp_uuids and v.opr != 'const':
             id0 = inp_uuids[v.id]
-            ops.append(Op(id0, -1, -1, 0, v.unscaled.qint, v.latency, 0.0))
+            ops.append(Op((), -1, (id0,), v.unscaled.qint, v.latency, 0.0))
             if v.id in needs_neg:
-                op_neg = Op(ii, -1, -2, 0, (-v.unscaled).qint, v.latency, 0.0)
+                op_neg = Op((ii,), -2, (), (-v.unscaled).qint, v.latency, 0.0)
                 ops.append(op_neg)
                 ii += 1
             continue
@@ -91,7 +91,7 @@ def _trace(inputs: Sequence[FVariable], outputs: Sequence[FVariable]):
                 sub = int(f1 < 0)
                 data = int(log2(abs(f1 / f0)))
                 assert id0 < ii and id1 < ii, f'{id0} {id1} {ii} {v.id}'
-                op = Op(id0, id1, sub, data, v.unscaled.qint, v.latency, 0.0)
+                op = Op((id0, id1), sub, (data,), v.unscaled.qint, v.latency, 0.0)
             case 'cadd':
                 v0 = v._from[0]
                 f0 = v0._factor
@@ -99,20 +99,22 @@ def _trace(inputs: Sequence[FVariable], outputs: Sequence[FVariable]):
                 assert v._data is not None, 'cadd must have data'
                 qint = v.unscaled.qint
                 data = v._data
+                value = ((data & 0xFFFFFFFF) + 0x80000000) % 0x100000000 - 0x80000000
+                shift = (((data >> 32) & 0xFFFFFFFF) + 0x80000000) % 0x100000000 - 0x80000000
                 assert id0 < ii, f'{id0} {ii} {v.id}'
-                op = Op(id0, -1, 4, data, qint, v.latency, 0.0)
+                op = Op((id0,), 4, (value, shift), qint, v.latency, 0.0)
             case 'wrap':
                 v0 = v._from[0]
                 id0 = index[v0.id] + (v0._factor < 0)
                 assert id0 < ii, f'{id0} {ii} {v.id}'
                 opcode = 3
-                op = Op(id0, -1, opcode, 0, v.unscaled.qint, v.latency, 0.0)
+                op = Op((id0,), opcode, (), v.unscaled.qint, v.latency, 0.0)
             case 'relu':
                 v0 = v._from[0]
                 id0 = index[v0.id] + (v0._factor < 0)
                 assert id0 < ii, f'{id0} {ii} {v.id}'
                 opcode = 2
-                op = Op(id0, -1, opcode, 0, v.unscaled.qint, v.latency, 0.0)
+                op = Op((id0,), opcode, (), v.unscaled.qint, v.latency, 0.0)
             case 'const':
                 qint = v.unscaled.qint
                 assert qint.min == qint.max, f'const {v.id} {qint.min} {qint.max}'
@@ -120,7 +122,7 @@ def _trace(inputs: Sequence[FVariable], outputs: Sequence[FVariable]):
                 step = float(2.0**-f)
                 qint = QInterval(float(qint.min), float(qint.min), step)
                 data = qint.min / step
-                op = Op(-1, -1, 5, int(data), qint, v.latency, 0.0)
+                op = Op((), 5, (int(data),), qint, v.latency, 0.0)
             case 'msb_mux':
                 qint = v.unscaled.qint
                 key, in0, in1 = v._from
@@ -129,15 +131,14 @@ def _trace(inputs: Sequence[FVariable], outputs: Sequence[FVariable]):
                 id0, id1 = index[in0.id] + (in0._factor < 0), index[in1.id] + (in1._factor < 0)
                 f0, f1 = in0._factor, in1._factor
                 shift = int(log2(abs(f1 / f0)))
-                data = idk + (shift << 32)
                 assert idk < ii and id0 < ii and id1 < ii, f'{idk} {id0} {id1} {ii} {v.id}'
-                op = Op(id0, id1, opcode, data, qint, v.latency, 0.0)
+                op = Op((id0, id1, idk), opcode, (shift,), qint, v.latency, 0.0)
             case 'vmul':
                 v0, v1 = v._from
                 opcode = 7
                 id0, id1 = index[v0.id], index[v1.id]
                 assert id0 < ii and id1 < ii, f'{id0} {id1} {ii} {v.id}'
-                op = Op(id0, id1, opcode, 0, v.unscaled.qint, v.latency, 0.0)
+                op = Op((id0, id1), opcode, (), v.unscaled.qint, v.latency, 0.0)
             case 'lookup':
                 opcode = 8
                 v0 = v._from[0]
@@ -152,14 +153,14 @@ def _trace(inputs: Sequence[FVariable], outputs: Sequence[FVariable]):
                     data = len(table_id_map)
                     table_id_map[tb_bash] = data
                     lookup_tables.append(v._table)
-                op = Op(id0, -1, opcode, data, v.unscaled.qint, v.latency, 0.0)
+                op = Op((id0,), opcode, (data,), v.unscaled.qint, v.latency, 0.0)
             case 'bit_unary':
                 v0 = v._from[0]
                 id0 = index[v0.id] + (v0._factor < 0)
                 assert id0 < ii, f'{id0} {ii} {v.id}'
                 assert v._data is not None, 'bit_unary must have data'
                 opcode = 9
-                op = Op(id0, -1, opcode, int(v._data), v.unscaled.qint, v.latency, 0.0)
+                op = Op((id0,), opcode, (int(v._data),), v.unscaled.qint, v.latency, 0.0)
             case 'bit_binary':
                 v0, v1 = v._from
                 id0, id1 = index[v0.id], index[v1.id]
@@ -167,15 +168,14 @@ def _trace(inputs: Sequence[FVariable], outputs: Sequence[FVariable]):
                 id0, id1 = id0 + (f0 < 0), id1 + (f1 < 0)
                 assert id0 < ii and id1 < ii, f'{id0} {id1} {ii} {v.id}'
                 assert v._data is not None, 'bit_binary must have data'
-                _data = int(log2(abs(f1 / f0))) & 0xFFFFFFFF
-                _data += int(v._data) << 56
-                op = Op(id0, id1, 10, _data, v.unscaled.qint, v.latency, 0.0)
+                data = (int(log2(abs(f1 / f0))), int(v._data))
+                op = Op((id0, id1), 10, data, v.unscaled.qint, v.latency, 0.0)
             case _:
                 raise NotImplementedError(f'Operation "{v.opr}" is not supported in tracing')
 
         ops.append(op)
         if v.id in needs_neg:
-            op_neg = Op(ii, -1, -2, 0, (-v.unscaled).qint, v.latency, 0)
+            op_neg = Op((ii,), -2, (), (-v.unscaled).qint, v.latency, 0)
             ops.append(op_neg)
             ii += 1
 

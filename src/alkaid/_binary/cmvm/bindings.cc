@@ -130,7 +130,21 @@ static nb::object make_py_comblogic(const CombLogicResult &sol) {
     nb::list ops;
     for (auto &op : sol.ops) {
         auto qint = QInterval_cls(op.qint.min, op.qint.max, op.qint.step);
-        ops.append(Op_cls(op.id0, op.id1, op.opcode, op.data, qint, op.latency, op.cost));
+        nb::object addr;
+        nb::object data;
+        switch (op.opcode) {
+        case -1:
+            addr = nb::make_tuple();
+            data = nb::make_tuple(op.id0);
+            break;
+        case 0:
+        case 1:
+            addr = nb::make_tuple(op.id0, op.id1);
+            data = nb::make_tuple(op.data);
+            break;
+        default: throw std::runtime_error("Unknown opcode from CMVM solver: " + std::to_string(op.opcode));
+        }
+        ops.append(Op_cls(addr, op.opcode, data, qint, op.latency, op.cost));
     }
 
     nb::list inp_shifts, out_idxs, out_shifts, out_negs;

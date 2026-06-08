@@ -57,3 +57,16 @@ def test_cmvm_solve(kernel, method0, method1, hard_dc, decompose_dc, search_all_
     _ = pipe.__repr__()
 
     np.testing.assert_allclose(pipe.kernel, kernel)
+
+
+def test_cmvm_output_uses_tuple_ops():
+    sol: Pipeline = cmvm_solve(np.array([[1, -2], [3, 4]], dtype=np.float32), hard_dc=0)
+    ops = [op for stage in sol.solutions for op in stage.ops]
+
+    assert ops
+    assert all(op.opcode in (-1, 0, 1) for op in ops)
+    assert all(isinstance(op.addr, tuple) and isinstance(op.data, tuple) for op in ops)
+    assert all(not hasattr(op, name) for op in ops for name in ('id0', 'id1'))
+    assert all(
+        (op.addr == () and len(op.data) == 1) if op.opcode == -1 else (len(op.addr) == 2 and len(op.data) == 1) for op in ops
+    )

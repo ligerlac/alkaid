@@ -33,7 +33,7 @@ def canon_sort_map(comb: CombLogic) -> dict[int, int]:
         order[i, 5] = max((order[idx, 5] for idx in op.input_ids), default=-1) + 1
         order[i, 4] = -op.opcode
         order[i, 1:4] = op.qint
-        order[i, 0] = op.data >> 32 & 0xFFFFFFFF if op.opcode == 6 else op.data
+        order[i, 0] = op.data[0] if op.data else 0
     return {int(j): int(i) for i, j in enumerate(np.lexsort(order.T))}
 
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "alir_types.hh"
+
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -19,7 +21,7 @@ namespace alir {
             int64_t *out,
             const double *inputs,
             size_t n_in,
-            int32_t input_idx,
+            uint32_t input_idx,
             double scale,
             int64_t mask,
             int64_t sign_bit,
@@ -64,6 +66,29 @@ namespace alir {
                     r >>= global_shift;
                     out[s] = r;
                 }
+            }
+        }
+
+        template <int B>
+        inline void op_sum(
+            int64_t *out,
+            const int64_t *buffer,
+            const Op_SumTerm *terms,
+            uint32_t n_terms,
+            int32_t global_shift
+        ) {
+            for (int s = 0; s < B; ++s) {
+                int64_t acc = 0;
+                for (uint32_t i = 0; i < n_terms; ++i) {
+                    const Op_SumTerm &term = terms[i];
+                    int64_t v = buffer[(size_t)term.addr * B + s];
+                    if (term.shift >= 0)
+                        v <<= term.shift;
+                    else
+                        v >>= -term.shift;
+                    acc = term.sign > 0 ? acc + v : acc - v;
+                }
+                out[s] = global_shift >= 0 ? (acc >> global_shift) : (acc << -global_shift);
             }
         }
 

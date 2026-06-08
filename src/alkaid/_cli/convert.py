@@ -34,6 +34,14 @@ def to_alkaid(
     from alkaid.trace import HWConfig, trace
     from alkaid.types import CombLogic
 
+    if flavor == 'auto':
+        if path.suffix == '.json':
+            flavor = 'json'
+        elif path.suffixes == ['.json', '.gz']:
+            flavor = 'json.gz'
+        else:
+            flavor = 'verilog'
+
     if model_path.suffix in {'.h5', '.keras'}:
         import zipfile
 
@@ -77,6 +85,14 @@ def to_alkaid(
 
     else:
         raise ValueError(f'Unsupported model file format: {model_path}')
+
+    if flavor in ('json', 'json.gz'):
+        if verbose > 1:
+            print('Saving ALIR model...')
+        comb.save(path)
+        if verbose > 1:
+            print('ALIR model saved')
+        return
 
     if flavor in ('verilog', 'vhdl'):
         if n_stages > 0:
@@ -187,7 +203,6 @@ def to_alkaid(
 
 
 def convert_main(args):
-    args.outdir.mkdir(parents=True, exist_ok=True)
     hw_conf = tuple(args.hw_config)
     if args.metadata is not None:
         with open(args.metadata) as f:
@@ -230,9 +245,9 @@ def _add_convert_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         '--flavor',
         type=str,
-        default='verilog',
-        choices=['verilog', 'vhdl', 'vitis', 'hlslib', 'oneapi'],
-        help='Flavor for alkaid model',
+        default='auto',
+        choices=['auto', 'json', 'json.gz', 'verilog', 'vhdl', 'vitis', 'hlslib', 'oneapi'],
+        help='Flavor for alkaid model. "auto" will choose json or json.gz based on output name, or Verilog otherwise.',
     )
     parser.add_argument('--latency-cutoff', '-lc', type=float, default=5, help='Latency cutoff for pipelining')
     parser.add_argument('--part-name', '-p', type=str, default='xcvu13p-flga2577-2-e', help='FPGA part name')

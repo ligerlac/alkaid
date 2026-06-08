@@ -1,3 +1,5 @@
+import struct
+
 import numpy as np
 from numpy.typing import NDArray
 
@@ -15,14 +17,17 @@ from .cmvm_bin import (
 )
 
 
-def alir_interp_run(bin_logic: NDArray[np.int32], data: NDArray, n_threads: int = 1, dump: bool = False):
+def alir_interp_run(bin_logic: bytes, data: NDArray, n_threads: int = 1, dump: bool = False):
     from .alir_bin import run_interp
 
-    inp_size = int(bin_logic[2])
+    if len(bin_logic) < 24:
+        raise ValueError('Invalid binary logic data')
+    magic, _spec, inp_size, _n_out, _n_ops, _n_tables = struct.unpack_from('<4sIIIII', bin_logic)
+    if magic != b'ALIR':
+        raise ValueError(f'Invalid ALIR bytecode magic {magic!r}')
     assert data.size % inp_size == 0, f'Input size {data.size} is not divisible by {inp_size}'
 
     inputs = np.ascontiguousarray(np.ravel(data), dtype=np.float64)
-    bin_logic = np.ascontiguousarray(np.ravel(bin_logic), dtype=np.int32)
     return run_interp(bin_logic, inputs, n_threads, dump=dump)
 
 

@@ -30,28 +30,33 @@ def ssa_gen(sol: CombLogic, neg_repo: dict[int, tuple[int, str]], print_latency:
 
         match op.opcode:
             case -2:  # Negation
-                bw0, v0 = widths[op.id0], f'v{op.id0}'
-                is_signed = int(ops[op.id0].qint.min < 0)
+                a = op.addr[0]
+                bw0, v0 = widths[a], f'v{a}'
+                is_signed = int(ops[a].qint.min < 0)
                 line = f'op_{i}:entity work.negative generic map(BW_IN=>{bw0},BW_OUT=>{bw},IN_SIGNED=>{is_signed}) port map(neg_in=>{v0},neg_out=>v{i});'
 
             case -1:  # Input marker
-                i0, i1 = inp_idxs[op.id0]
+                i0, i1 = inp_idxs[op.data[0]]
                 line = f'v{i} <= model_inp({i0} downto {i1});'
 
-            case 0 | 1:  # Common a+/-b<<shift oprs
-                p0, p1 = kifs[op.id0], kifs[op.id1]
-                bw0, bw1 = widths[op.id0], widths[op.id1]
+            case 0 | 1:  # Common binary a+/-b<<shift oprs
+                assert len(op.addr) == 2 and len(op.data) == 1
+                a, b = op.addr
+                data_shift = op.data[0]
+                p0, p1 = kifs[a], kifs[b]
+                bw0, bw1 = widths[a], widths[b]
                 s0, f0, s1, f1 = int(p0[0]), p0[2], int(p1[0]), p1[2]
-                shift = op.data + f0 - f1
-                dlsbs = max(f0, f1 - op.data) - kifs[i][2]
-                line = f'op_{i}:entity work.shift_adder generic map(BW_INPUT0=>{bw0},BW_INPUT1=>{bw1},SIGNED0=>{s0},SIGNED1=>{s1},BW_OUT=>{bw},DROP_LSBS=>{dlsbs},SHIFT1=>{shift},IS_SUB=>{op.opcode}) port map(in0=>v{op.id0},in1=>v{op.id1},result=>v{i});'
+                shift = data_shift + f0 - f1
+                dlsbs = max(f0, f1 - data_shift) - kifs[i][2]
+                line = f'op_{i}:entity work.shift_adder generic map(BW_INPUT0=>{bw0},BW_INPUT1=>{bw1},SIGNED0=>{s0},SIGNED1=>{s1},BW_OUT=>{bw},DROP_LSBS=>{dlsbs},SHIFT1=>{shift},IS_SUB=>{op.opcode}) port map(in0=>v{a},in1=>v{b},result=>v{i});'
 
             case 2:  # ReLU
-                lsb_bias = kifs[op.id0][2] - kifs[i][2]
+                a = op.addr[0]
+                lsb_bias = kifs[a][2] - kifs[i][2]
                 i0, i1 = bw + lsb_bias - 1, lsb_bias
-                v0_name = f'v{op.id0}'
-                bw0 = widths[op.id0]
-                if ops[op.id0].qint.min < 0:
+                v0_name = f'v{a}'
+                bw0 = widths[a]
+                if ops[a].qint.min < 0:
                     if bw > 1:
                         line = f'v{i} <= {v0_name}({i0} downto {i1}) and ({bw - 1} downto 0 => not {v0_name}({bw0 - 1}));'
                     else:
@@ -60,12 +65,13 @@ def ssa_gen(sol: CombLogic, neg_repo: dict[int, tuple[int, str]], print_latency:
                     line = f'v{i} <= {v0_name}({i0} downto {i1});'
 
             case 3 | -3:  # Explicit quantization
-                lsb_bias = kifs[op.id0][2] - kifs[i][2]
+                a = op.addr[0]
+                lsb_bias = kifs[a][2] - kifs[i][2]
                 i0, i1 = bw + lsb_bias - 1, lsb_bias
-                v0_name = f'v{op.id0}'
-                bw0 = widths[op.id0]
+                v0_name = f'v{a}'
+                bw0 = widths[a]
                 if i0 >= bw0:
-                    assert ops[op.id0].qint.min < 0, f'{i}, {op.id0}'
+                    assert ops[a].qint.min < 0, f'{i}, {a}'
 
                     if i1 >= bw0:
                         v0_name = f'({i0 - i1} downto 0 => {v0_name}({bw0 - 1}))'
@@ -76,34 +82,30 @@ def ssa_gen(sol: CombLogic, neg_repo: dict[int, tuple[int, str]], print_latency:
                     line = f'v{i} <= {v0_name}({i0} downto {i1});'
 
             case 4:  # constant addition
-                val = ((op.data & 0xFFFFFFFF) + 0x80000000) % 0x100000000 - 0x80000000
-                f1 = (((op.data >> 32) & 0xFFFFFFFF) + 0x80000000) % 0x100000000 - 0x80000000
-                bw0, bw1 = widths[op.id0], ceil(log2(abs(val) + 1))
-                s0, _, f0 = kifs[op.id0]
+                a = op.addr[0]
+                val, f1 = op.data
+                bw0, bw1 = widths[a], ceil(log2(abs(val) + 1))
+                s0, _, f0 = kifs[a]
                 s0, s1 = int(s0), int(val < 0)
                 shift = f0 - f1
-                v0 = f'v{op.id0}[{bw0 - 1}:0]'
                 v1 = f'{bin(abs(val))[2:]}'
                 dlsbs = max(f0, f1) - kifs[i][2]
 
-                line = f'op_{i}:entity work.shift_adder generic map(BW_INPUT0=>{bw0},BW_INPUT1=>{bw1},SIGNED0=>{s0},SIGNED1=>0,BW_OUT=>{bw},DROP_LSBS=>{dlsbs},SHIFT1=>{shift},IS_SUB=>{s1}) port map(in0=>v{op.id0},in1=>"{v1}",result=>v{i});'
+                line = f'op_{i}:entity work.shift_adder generic map(BW_INPUT0=>{bw0},BW_INPUT1=>{bw1},SIGNED0=>{s0},SIGNED1=>0,BW_OUT=>{bw},DROP_LSBS=>{dlsbs},SHIFT1=>{shift},IS_SUB=>{s1}) port map(in0=>v{a},in1=>"{v1}",result=>v{i});'
             case 5:  # constant
-                num = op.data
+                num = op.data[0]
                 if num < 0:
                     num = 2**bw + num
                 bin_val = format(num, f'0{bw}b')
                 line = f'v{i} <= "{bin_val}";'
 
             case 6:  # MSB Muxing
-                k, a, b = op.data & 0xFFFFFFFF, op.id0, op.id1
+                a, b, k = op.addr
                 p0, p1 = kifs[a], kifs[b]
-                inv = '0'
                 bwk, bw0, bw1 = widths[k], widths[a], widths[b]
                 s0, f0, s1, f1 = int(p0[0]), p0[2], int(p1[0]), p1[2]
                 fo = kifs[i][2]
-                _shift = (op.data >> 32) & 0xFFFFFFFF
-                _shift = _shift if _shift < 0x80000000 else _shift - 0x100000000
-                shift1 = fo - f1 + _shift
+                shift1 = fo - f1 + op.data[0]
                 shift0 = fo - f0
                 assert shift0 == 0 or shift1 == 0, f'{i}, {op}, shift0={shift0}, shift1={shift1}'
                 shift = shift1 * (shift1 > 0) - shift0 * (shift0 > 0)
@@ -112,22 +114,23 @@ def ssa_gen(sol: CombLogic, neg_repo: dict[int, tuple[int, str]], print_latency:
                     v0, bw0 = 'B"0"', 1
                 if bw1 == 0:
                     v1, bw1 = 'B"0"', 1
-                line = f'op_{i}:entity work.mux generic map(BW_INPUT0=>{bw0},BW_INPUT1=>{bw1},SIGNED0=>{s0},SIGNED1=>{s1},BW_OUT=>{bw},SHIFT1=>{shift},INVERT1=>{inv}) port map(key=>v{k}({bwk - 1}),in0=>{v0},in1=>{v1},result=>v{i});'
+                line = f'op_{i}:entity work.mux generic map(BW_INPUT0=>{bw0},BW_INPUT1=>{bw1},SIGNED0=>{s0},SIGNED1=>{s1},BW_OUT=>{bw},SHIFT1=>{shift}) port map(key=>v{k}({bwk - 1}),in0=>{v0},in1=>{v1},result=>v{i});'
 
             case 7:  # Multiplication
-                bw0, bw1 = widths[op.id0], widths[op.id1]
-                s0, s1 = int(kifs[op.id0][0]), int(kifs[op.id1][0])
-                line = f'op_{i}:entity work.multiplier generic map(BW_INPUT0=>{bw0},BW_INPUT1=>{bw1},SIGNED0=>{s0},SIGNED1=>{s1},BW_OUT=>{bw}) port map(in0=>v{op.id0},in1=>v{op.id1},result=>v{i});'
+                a, b = op.addr
+                bw0, bw1 = widths[a], widths[b]
+                s0, s1 = int(kifs[a][0]), int(kifs[b][0])
+                line = f'op_{i}:entity work.multiplier generic map(BW_INPUT0=>{bw0},BW_INPUT1=>{bw1},SIGNED0=>{s0},SIGNED1=>{s1},BW_OUT=>{bw}) port map(in0=>v{a},in1=>v{b},result=>v{i});'
 
             case 8:  # Lookup Table
                 name = get_table_name_memfile(sol, op)[0]
-                bw0 = widths[op.id0]
-                line = f'op_{i}:entity work.lookup_table generic map(BW_IN=>{bw0},BW_OUT=>{bw},MEM_FILE=>"{name}") port map(inp=>v{op.id0},outp=>v{i});'
+                a = op.addr[0]
+                bw0 = widths[a]
+                line = f'op_{i}:entity work.lookup_table generic map(BW_IN=>{bw0},BW_OUT=>{bw},MEM_FILE=>"{name}") port map(inp=>v{a},outp=>v{i});'
 
             case 9:  # Bitwise unary ops
-                bw0 = widths[op.id0]
-                v0_name = f'v{op.id0}'
-                match op.data:
+                v0_name = f'v{op.addr[0]}'
+                match op.data[0]:
                     case 0:  # NOT
                         line = f'v{i} <= not {v0_name};'
                     case 1:  # ANY
@@ -137,19 +140,20 @@ def ssa_gen(sol: CombLogic, neg_repo: dict[int, tuple[int, str]], print_latency:
                     case _:
                         raise ValueError(f'Unknown unary bitwise op {op.data} for operation {i} ({op})')
             case 10:  # Bitwise Binary
-                # data: {subopcode[63:56], reserved[55:32], shift[31:0]}
-                data = op.data
-                subop, _shift = (data >> 56) & 0xFF, data & 0xFFFFFFFF
-                shift = (_shift + 0x80000000) % 0x100000000 - 0x80000000 + kifs[op.id0][2] - kifs[op.id1][2]
+                a, b = op.addr
+                data_shift, subop = op.data
+                shift = data_shift + kifs[a][2] - kifs[b][2]
 
-                bw0, v0_name = widths[op.id0], f'v{op.id0}'
-                s0 = ops[op.id0].qint.min < 0
-                bw1, v1_name = widths[op.id1], f'v{op.id1}'
-                s1 = ops[op.id1].qint.min < 0
+                bw0, v0_name = widths[a], f'v{a}'
+                s0 = ops[a].qint.min < 0
+                bw1, v1_name = widths[b], f'v{b}'
+                s1 = ops[b].qint.min < 0
 
                 s0, s1 = int(s0), int(s1)
 
                 line = f'op_{i}:entity work.binop generic map(BW_INPUT0=>{bw0},BW_INPUT1=>{bw1},SIGNED0=>{s0},SIGNED1=>{s1},BW_OUT=>{bw},SHIFT1=>{shift},SUBOP=>{subop}) port map(in0=>{v0_name},in1=>{v1_name},result=>v{i});'
+            case 11:
+                raise ValueError(f'VHDL codegen does not support variadic opcode 11 for operation {i}: {op}')
             case _:
                 raise ValueError(f'Unknown opcode {op.opcode} for operation {i} ({op})')
 
@@ -187,9 +191,9 @@ def comb_logic_gen(sol: CombLogic, fn_name: str, print_latency: bool = False, ti
     blk = '\n    '
 
     extra_lib = ''
-    if any(op.opcode == 9 and op.data == 1 for op in sol.ops):
+    if any(op.opcode == 9 and op.data[0] == 1 for op in sol.ops):
         extra_lib += 'use ieee.std_logic_misc.or_reduce;\n'
-    if any(op.opcode == 9 and op.data == 2 for op in sol.ops):
+    if any(op.opcode == 9 and op.data[0] == 2 for op in sol.ops):
         extra_lib += 'use ieee.std_logic_misc.and_reduce;\n'
 
     code = f"""library ieee;

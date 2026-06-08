@@ -11,8 +11,8 @@ from ...types import CombLogic, Op, QInterval
 def gen_table_name_defline(sol: CombLogic, op: Op, typestr_fn: Callable[[bool | int, int, int], str]) -> tuple[str, str]:
     assert op.opcode == 8
     assert sol.lookup_tables is not None
-    table = sol.lookup_tables[op.data]
-    data = table.padded_table(sol.ops[op.id0].qint)
+    table = sol.lookup_tables[op.data[0]]
+    data = table.padded_table(sol.ops[op.addr[0]].qint)
     data = np.nan_to_num(data, nan=0.0).astype(np.int32)
     data = interpret_as(data, *table.spec.out_kif)
     values = ','.join(map(str, data))
@@ -78,7 +78,7 @@ def ssa_gen(comb: CombLogic, print_latency: bool, typestr_fn: Callable[[bool | i
 
         _type = all_types[i]
 
-        ref0 = f'v{op.id0}'
+        ref0 = f'v{op.addr[0]}' if op.addr else ''
 
         match op.opcode:
             case -2:
@@ -86,13 +86,18 @@ def ssa_gen(comb: CombLogic, print_latency: bool, typestr_fn: Callable[[bool | i
                 val = f'-{ref0}'
             case -1:
                 # Input marker
-                val = f'model_inp[{op.id0}]'
+                val = f'model_inp[{op.data[0]}]'
             case 0 | 1:
                 # Common a+/-b<<shift op
-                ref1 = f'bit_shift<{op.data}>(v{op.id1})' if op.data != 0 else f'v{op.id1}'
+                a, b = op.addr
+                data_shift = op.data[0]
+                ref0 = f'v{a}'
+                ref1 = f'bit_shift<{data_shift}>(v{b})' if data_shift != 0 else f'v{b}'
                 val = f'{ref0} {"-" if op.opcode == 1 else "+"} {ref1}'
             case 2:
-                if ops[op.id0].qint.min < 0:
+                a = op.addr[0]
+                ref0 = f'v{a}'
+                if ops[a].qint.min < 0:
                     val = f'{ref0} > 0 ? {_type}({ref0}) : {_type}(0)'
                 else:
                     val = ref0
@@ -101,9 +106,7 @@ def ssa_gen(comb: CombLogic, print_latency: bool, typestr_fn: Callable[[bool | i
                 val = ref0
             case 4:
                 # Constant addition
-                _number = op.data * op.qint.step
-                v = ((op.data & 0xFFFFFFFF) + 0x80000000) % 0x100000000 - 0x80000000
-                f = (((op.data >> 32) & 0xFFFFFFFF) + 0x80000000) % 0x100000000 - 0x80000000
+                v, f = op.data
                 sign = '-' if v < 0 else '+'
                 step = 2.0**-f
                 v = abs(v) * step
@@ -112,17 +115,17 @@ def ssa_gen(comb: CombLogic, print_latency: bool, typestr_fn: Callable[[bool | i
 
             case 5:
                 # Define constant
-                _number = op.data * op.qint.step
+                _number = op.data[0] * op.qint.step
                 val = f'{_number}'
             case 6:
                 # MSB Mux
-                id_c = op.data & 0xFFFFFFFF
+                a, b, id_c = op.addr
                 bw_k = sum(all_kifs[id_c])
-                shift = (op.data >> 32) & 0xFFFFFFFF
-                shift = shift if shift < 0x80000000 else shift - 0x100000000
+                shift = op.data[0]
                 ref_k = f'v{id_c}[{bw_k - 1}]'
-                ref1 = f'v{op.id1}' if shift == 0 else f'bit_shift<{shift}>(v{op.id1})'
-                bw0, bw1 = sum(all_kifs[op.id0]), sum(all_kifs[op.id1])
+                ref0 = f'v{a}'
+                ref1 = f'v{b}' if shift == 0 else f'bit_shift<{shift}>(v{b})'
+                bw0, bw1 = sum(all_kifs[a]), sum(all_kifs[b])
                 if bw0 == 0:
                     ref0 = '0'
                 if bw1 == 0:
@@ -130,18 +133,22 @@ def ssa_gen(comb: CombLogic, print_latency: bool, typestr_fn: Callable[[bool | i
                 val = f'{ref_k} ? {_type}({ref0}) : {_type}({ref1})'
             case 7:
                 # Multiplication
-                ref1 = f'v{op.id1}'
+                a, b = op.addr
+                ref0 = f'v{a}'
+                ref1 = f'v{b}'
                 val = f'{ref0} * {ref1}'
             case 8:
                 # Look-up
                 table_name = gen_table_name_defline(comb, op, typestr_fn)[0]
-                ref0 = f'v{op.id0}'
+                ref0 = f'v{op.addr[0]}'
                 val = f'{table_name}[{ref0}.range()]'
             case 9:
                 # Unary bit ops
-                match op.data:
+                a = op.addr[0]
+                ref0 = f'v{a}'
+                match op.data[0]:
                     case 0:  # NOT
-                        _shift = all_kifs[op.id0][2] - all_kifs[i][2]
+                        _shift = all_kifs[a][2] - all_kifs[i][2]
                         if _shift != 0:
                             ref0 = f'bit_shift<{_shift}>({ref0})'
                         val = f'~{ref0}'
@@ -150,16 +157,18 @@ def ssa_gen(comb: CombLogic, print_latency: bool, typestr_fn: Callable[[bool | i
                     case 2:  # AND
                         _k, _i, _f = all_kifs[i]
                         target = -(2.0**-_f) if _k else 2.0**_i - 2.0**-_f
-                        val = f'({ref0} == {all_types[op.id0]}({-target}))'
+                        val = f'({ref0} == {all_types[a]}({-target}))'
                     case _:
                         raise ValueError(f'Unsupported unary bit op subop: {op.data}')
             case 10:
                 # Binary bit ops
-                # data: {subopcode[63:56], reserved[55:32], shift[31:0]}
-                ref1 = f'v{op.id1}'
-                shift = ((op.data & 0xFFFFFFFF) + 0x80000000) % 0x100000000 - 0x80000000
+                a, b = op.addr
+                data_shift, subop = op.data
+                ref0 = f'v{a}'
+                ref1 = f'v{b}'
+                shift = data_shift
                 ref1 = ref1 if shift == 0 else f'bit_shift<{shift}>({ref1})'
-                match (op.data >> 56) & 0xFF:
+                match subop:
                     case 0:  # AND
                         val = f'{_type}({ref0}) & {_type}({ref1})'
                     case 1:  # OR
@@ -168,6 +177,8 @@ def ssa_gen(comb: CombLogic, print_latency: bool, typestr_fn: Callable[[bool | i
                         val = f'{_type}({ref0}) ^ {_type}({ref1})'
                     case _:
                         raise ValueError(f'Unknown binary bit op subop: {op.data}')
+            case 11:
+                raise ValueError(f'HLS codegen does not support variadic opcode 11: {op}')
             case _:
                 raise ValueError(f'Unsupported opcode: {op.opcode}')
 
