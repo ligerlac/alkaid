@@ -3,6 +3,7 @@ from math import ceil, log2
 import numpy as np
 
 from ....types import CombLogic
+from .._ternary_codegen import vhdl_ternary_line
 from ..verilog.comb import get_table_name_memfile
 
 
@@ -153,7 +154,7 @@ def ssa_gen(sol: CombLogic, neg_repo: dict[int, tuple[int, str]], print_latency:
 
                 line = f'op_{i}:entity work.binop generic map(BW_INPUT0=>{bw0},BW_INPUT1=>{bw1},SIGNED0=>{s0},SIGNED1=>{s1},BW_OUT=>{bw},SHIFT1=>{shift},SUBOP=>{subop}) port map(in0=>{v0_name},in1=>{v1_name},result=>v{i});'
             case 11:
-                raise ValueError(f'VHDL codegen does not support variadic opcode 11 for operation {i}: {op}')
+                line = vhdl_ternary_line(sol, i)
             case _:
                 raise ValueError(f'Unknown opcode {op.opcode} for operation {i} ({op})')
 

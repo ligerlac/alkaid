@@ -5,6 +5,7 @@ from uuid import UUID
 import numpy as np
 
 from ....types import CombLogic, Op
+from .._ternary_codegen import verilog_ternary_line
 
 
 def gen_memfile(sol: CombLogic, op: Op) -> str:
@@ -189,7 +190,7 @@ def ssa_gen(sol: CombLogic, neg_repo: dict[int, tuple[int, str]], print_latency:
                 line = f'{_def} binop #({bw0},{bw1},{s0},{s1},{bw},{shift},{subop}) op_{i} ({v0_name}, {v1_name}, {v});'
 
             case 11:
-                raise ValueError(f'Verilog codegen does not support variadic opcode 11 for operation {i}: {op}')
+                line = verilog_ternary_line(sol, i, _def)
 
             case _:
                 raise ValueError(f'Unknown opcode {op.opcode} for operation {i} ({op})')

@@ -5,7 +5,7 @@ from xls import FunctionBuilder, Package, Value
 from xls.c_api import optimize_ir, parse_ir_package
 from xls.ir_builder import BuilderBase, BValue, Function
 
-from ...types import CombLogic
+from ...types import CombLogic, Op, _iter_sum_terms
 
 
 def _extend(bb: BuilderBase, val: BValue, old_bw: int, new_bw: int, is_signed: bool) -> BValue:
@@ -57,6 +57,26 @@ def shift_adder(
         accum = bb.add_add(v0, v1)
 
     return bb.add_bit_slice(accum, drop_lsbs, bw_out)
+
+
+def sum_adder(bb: BuilderBase, ops: list[Op], op_idx: int, buf: list[BValue], kifs, widths) -> BValue:
+    op = ops[op_idx]
+    terms = [(addr, 1 if plus else -1, shift) for addr, plus, shift in _iter_sum_terms(op)]
+    term_fracs = [kifs[idx][2] - shift for idx, _, shift in terms]
+    align_f = max(term_fracs)
+    dlsbs = align_f - kifs[op_idx][2]
+    assert dlsbs >= 0
+
+    right_pads = [align_f - term_frac for term_frac in term_fracs]
+    max_term_bw = max(widths[idx] + pad for (idx, _, _), pad in zip(terms, right_pads, strict=True))
+    bw_add = max(max_term_bw + ceil(log2(len(terms) + 1)) + 2, widths[op_idx] + dlsbs + 1)
+    accum = _literal(bb, bw_add, 0)
+
+    for (idx, sign, _), pad in zip(terms, right_pads, strict=True):
+        term = _shift_pad(bb, buf[idx], pad, widths[idx], bw_add, bool(kifs[idx][0]))
+        accum = bb.add_add(accum, term) if sign > 0 else bb.add_sub(accum, term)
+
+    return bb.add_bit_slice(accum, dlsbs, widths[op_idx])
 
 
 def negate(bb: BuilderBase, val: BValue, bw_in: int, bw_out: int, in_signed: bool):
@@ -328,7 +348,7 @@ def _build_core_ops(bb, pkg, sol, model_inp, inp_starts, inp_widths, kifs, width
                 buf[i] = bb.add_bit_slice(result, 0, bw)
 
             case 11:
-                raise ValueError(f'XLS codegen does not support variadic opcode 11: {op}')
+                buf[i] = sum_adder(bb, ops, i, buf, kifs, widths)
 
             case _:
                 raise ValueError(f'Unknown opcode {op.opcode}')

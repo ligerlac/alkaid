@@ -6,6 +6,7 @@ from .null_op import null_quant_elimin
 from .order import canonical_sort, topo_bandwidth_sort
 from .retrace import _retrace
 from .surrogate import add_surrogate
+from .ternary import fuse_ternary_adders
 
 
 def _fast_optimize(comb: CombLogic, keep_dead_inputs: bool = False) -> CombLogic:
@@ -42,3 +43,6 @@ def optimize(
     comb = canonical_sort(comb)
     comb = topo_bandwidth_sort(comb)
     return comb
+
+
+__all__ = ['optimize', 'canonicalize', 'common_subexpr_elimin', 'dead_code_elimin', 'null_quant_elimin', 'fuse_ternary_adders']

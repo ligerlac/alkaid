@@ -16,6 +16,7 @@ from numpy.typing import NDArray
 from alkaid.codegen.hls.hls_codegen import get_io_types, hls_logic_and_bridge_gen
 from alkaid.types import CombLogic
 
+from ...trace.passes import dead_code_elimin, fuse_ternary_adders
 from .. import hls
 from ..rtl.rtl_model import canon_name
 
@@ -27,7 +28,7 @@ class HLSModel:
 
     def __init__(
         self,
-        solution: CombLogic,
+        comb_logic: CombLogic,
         path: str | Path,
         prj_name: str | None = None,
         flavor: str = 'vitis',
@@ -39,8 +40,11 @@ class HLSModel:
         io_delay_minmax: tuple[float, float] = (0.2, 0.4),
         namespace: str = 'comb_logic',
         inline_header: bool = True,
+        ternary_fuse: bool = True,
     ):
-        self._solution = solution
+        if ternary_fuse:
+            comb_logic = dead_code_elimin(fuse_ternary_adders(comb_logic))
+        self._comb = comb_logic
         self._path = Path(path).resolve()
         self._prj_name = prj_name or canon_name(self._path.stem)
         self._flavor = flavor.lower()
@@ -80,7 +84,7 @@ class HLSModel:
 
         # Main logic and bridge
         template_def, bridge = hls_logic_and_bridge_gen(
-            self._solution,
+            self._comb,
             self._prj_name,
             self._flavor,
             self._pragma,
@@ -129,11 +133,11 @@ class HLSModel:
             pass
 
         # Dump the comb logic
-        self._solution.save(self._path / 'model/comb.json.gz')
+        self._comb.save(self._path / 'model/comb.json.gz')
 
         # Out-of-context top fn and its header
-        inp_type, out_type = get_io_types(self._solution, self._flavor)
-        n_in, n_out = len(self._solution.inp_qint), len(self._solution.out_qint)
+        inp_type, out_type = get_io_types(self._comb, self._flavor)
+        n_in, n_out = len(self._comb.inp_qint), len(self._comb.out_qint)
         fn_signature = f'void {self._prj_name}_fn({inp_type} model_inp[{n_in}], {out_type} model_out[{n_out}])'
 
         pragma_str = '\n'.join(self._pragma)
@@ -162,7 +166,7 @@ class HLSModel:
 
         # Metadata
         _metadata = {
-            'cost': self._solution.cost,
+            'cost': self._comb.cost,
             'flavor': self._flavor,
             'part_name': self._part_name,
             'clock_period': self._clock_period,
@@ -282,7 +286,7 @@ class HLSModel:
             the DA_DEFAULT_THREADS environment variable if set. If < 0, OpenMP will be disabled. Default is 0.
         """
         assert self._lib is not None, 'Library not loaded, call .compile() first.'
-        inp_size, out_size = self._solution.shape
+        inp_size, out_size = self._comb.shape
 
         if isinstance(data, Sequence):
             data = np.concatenate([a.reshape(a.shape[0], -1) for a in data], axis=-1)
@@ -312,14 +316,14 @@ class HLSModel:
         return out_data.reshape(n_sample, out_size)  # type: ignore
 
     def __repr__(self):
-        inp_size, out_size = self._solution.shape
-        inp_size, out_size = self._solution.shape
-        cost = round(self._solution.cost)
-        in_bits, out_bits = np.sum(self._solution.inp_kifs), np.sum(self._solution.out_kifs)
+        inp_size, out_size = self._comb.shape
+        inp_size, out_size = self._comb.shape
+        cost = round(self._comb.cost)
+        in_bits, out_bits = np.sum(self._comb.inp_kifs), np.sum(self._comb.out_kifs)
 
         spec = f"""Top Function: {self._prj_name}\n====================
 {inp_size} ({in_bits} bits) -> {out_size} ({out_bits} bits)
-combinational @ delay={self._solution.latency}
+combinational @ delay={self._comb.latency}
 Estimated cost: {cost} LUTs"""
 
         is_compiled = self._lib is not None

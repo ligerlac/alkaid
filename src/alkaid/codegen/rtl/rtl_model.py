@@ -13,6 +13,7 @@ from uuid import uuid4
 import numpy as np
 from numpy.typing import NDArray
 
+from ...trace.passes import dead_code_elimin, fuse_ternary_adders
 from ...trace.pipeline import to_pipeline
 from ...types import CombLogic, Pipeline
 from .. import rtl
@@ -103,6 +104,7 @@ class RTLModel:
         clock_period: float = 5,
         clock_uncertainty: float = 0.1,
         io_delay_minmax: tuple[float, float] = (0.2, 0.4),
+        ternary_fuse: bool = True,
     ):
         """Generate an RTL project and optional compiled emulator from `CombLogic`.
 
@@ -132,7 +134,11 @@ class RTLModel:
             Clock uncertainty in ns used in default OOC scripts. Default is 0.1.
         io_delay_minmax : tuple[float, float], optional
             Minimum and maximum IO delay in ns used in default OOC scripts. Default is (0.2, 0.4).
+        ternary_fuse : bool, optional
+            Whether to apply ternary adder fusion before codegen. Default is True.
         """
+        if ternary_fuse:
+            comb_logic = dead_code_elimin(fuse_ternary_adders(comb_logic))
         self._flavor = flavor.lower()
         self._comb = comb_logic
         self._path = Path(path).resolve()
@@ -153,8 +159,8 @@ class RTLModel:
         if (latency_cutoff > 0 or n_stages > 0) and self._pipe is None:
             _latency_cutoff = latency_cutoff if latency_cutoff > 0 else None
             _n_stages = n_stages if n_stages > 0 else None
-            assert isinstance(comb_logic, CombLogic)
-            self._pipe = to_pipeline(comb_logic, _n_stages, _latency_cutoff, verbose=False)
+            assert isinstance(self._comb, CombLogic)
+            self._pipe = to_pipeline(self._comb, _n_stages, _latency_cutoff, verbose=False)
 
         if self._pipe is not None:
             # get actual latency cutoff

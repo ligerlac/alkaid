@@ -5,7 +5,7 @@ from uuid import UUID
 import numpy as np
 
 from ...trace.fixed_variable import interpret_as
-from ...types import CombLogic, Op, QInterval
+from ...types import CombLogic, Op, QInterval, _iter_sum_terms
 
 
 def gen_table_name_defline(sol: CombLogic, op: Op, typestr_fn: Callable[[bool | int, int, int], str]) -> tuple[str, str]:
@@ -178,7 +178,16 @@ def ssa_gen(comb: CombLogic, print_latency: bool, typestr_fn: Callable[[bool | i
                     case _:
                         raise ValueError(f'Unknown binary bit op subop: {op.data}')
             case 11:
-                raise ValueError(f'HLS codegen does not support variadic opcode 11: {op}')
+                parts = []
+                for addr, plus, shift in _iter_sum_terms(op):
+                    term = f'v{addr}'
+                    if shift != 0:
+                        term = f'bit_shift<{shift}>({term})'
+                    if parts:
+                        parts.append(f'{"+" if plus else "-"} {term}')
+                    else:
+                        parts.append(term if plus else f'-{term}')
+                val = ' '.join(parts)
             case _:
                 raise ValueError(f'Unsupported opcode: {op.opcode}')
 
@@ -221,7 +230,7 @@ def get_io_types(sol: CombLogic, flavor: str):
 
 
 def hls_logic_and_bridge_gen(
-    sol: CombLogic,
+    comb: CombLogic,
     fn_name: str,
     flavor: str,
     pragmas: Sequence[str] | None = None,
@@ -231,18 +240,18 @@ def hls_logic_and_bridge_gen(
     namespace: str = '',
 ):
     typestr_fn = get_typestr_fn(flavor)
-    inp_t, out_t = get_io_types(sol, flavor)
+    inp_t, out_t = get_io_types(comb, flavor)
 
     if namespace and not namespace.endswith('::'):
         namespace += '::'
 
-    n_in, n_out = sol.shape
+    n_in, n_out = comb.shape
     template_def = 'template <typename inp_t, typename out_t>'
     fn_signature = f'void {fn_name}(inp_t model_inp[{n_in}], out_t model_out[{n_out}])'
     pragmas = pragmas or []
 
-    ssa_lines = ssa_gen(sol, print_latency=print_latency, typestr_fn=typestr_fn)
-    output_lines = output_gen(sol, typestr_fn=typestr_fn)
+    ssa_lines = ssa_gen(comb, print_latency=print_latency, typestr_fn=typestr_fn)
+    output_lines = output_gen(comb, typestr_fn=typestr_fn)
 
     indent = ' ' * n_indent
     base_indent = indent * n_base_indent

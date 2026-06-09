@@ -153,6 +153,7 @@ class JSONEncoder(json.JSONEncoder):
 
 
 def _iter_sum_terms(op: Op):
+    "->[src_addr, is_plus, shift]"
     assert op.opcode == 11
     assert len(op.addr) >= 2
     assert len(op.data) >= 2 * len(op.addr)
