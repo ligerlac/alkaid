@@ -424,6 +424,7 @@ class RTLModel:
         metadata: None | dict[str, Any] = None,
         xls_opt: bool = False,
         no_shreg: bool = False,
+        _env: dict[str, str] | None = None,
     ):
         """Compile the generated code to a emulator for logic simulation.
 
@@ -448,6 +449,8 @@ class RTLModel:
         no_shreg : bool, optional
             Whether to add shreg_extract="no" attribute to all pipeline registers in the generated RTL code.
             Default is False.
+        _env : dict[str, str] | None, optional
+            Additional environment variables to set during compilation, by default None
 
         Raises
         ------
@@ -456,7 +459,7 @@ class RTLModel:
         """
 
         self.write(metadata=metadata, xls_opt=xls_opt, no_shreg=no_shreg)
-        self._compile(verbose=verbose, openmp=openmp, nproc=nproc, o3=o3, clean=clean)
+        self._compile(verbose=verbose, openmp=openmp, nproc=nproc, o3=o3, clean=clean, _env=_env)
 
     def predict(self, data: NDArray[np.floating] | Sequence[NDArray[np.floating]], n_threads: int = 0) -> NDArray[np.floating]:
         """Run the model on the input data.

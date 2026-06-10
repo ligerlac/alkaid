@@ -302,9 +302,9 @@ def _check_single_assignment(conns: Sequence[Conn]):
 class Buffer(np.ndarray):
     def __new__(cls, sig: Signal, dtype=np.float64):
         obj = super().__new__(cls, sig.size, dtype)
+        obj._changed = False
         if sig.rst_to is not None:
             obj[:] = sig.rst_to
-        obj._changed = False
         return obj
 
     def __array_finalize__(self, obj):
@@ -567,7 +567,7 @@ class FSMEmu:
 
     def soft_reset(self):
         for sig in self.fsm.signals.values():
-            if sig.reg and sig.rst_to is not None:
+            if sig.reg and sig.rst_to is not None and sig.rst_if is not None and sig.rst_if.exposed:
                 self.buffers[sig.name][:] = sig.rst_to
         self._t = 0
 
