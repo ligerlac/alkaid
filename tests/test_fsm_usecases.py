@@ -17,6 +17,19 @@ def _require_verilator():
         pytest.skip('verilator not found')
 
 
+def _require_hdl(flavor: str):
+    _require_verilator()
+    if flavor == 'vhdl' and shutil.which('ghdl') is None:
+        pytest.skip('ghdl not found')
+
+
+@pytest.fixture(params=('verilog', 'vhdl'))
+def rtl_flavor(request):
+    flavor = request.param
+    _require_hdl(flavor)
+    return flavor
+
+
 def _fsmemu_step_run(emu: FSMEmu, data: dict, steps: int) -> dict[str, np.ndarray]:
     """Cycle-accurate Python reference from the emulator's current state."""
     out = {p.name: np.empty((steps, p.size), dtype=np.float64) for p in emu.fsm.out_signals}
@@ -54,15 +67,16 @@ def _rtl_step_run(emu: FSMProject, data: dict, steps: int) -> dict[str, np.ndarr
     return out
 
 
-def _run_both(fsm: FSM, data: dict, prj_name: str, path, steps: int | None = None) -> tuple[dict, dict]:
+def _run_both(fsm: FSM, data: dict, prj_name: str, path, flavor: str, steps: int | None = None) -> tuple[dict, dict]:
     """Compare the Verilated emulator against the cycle-accurate Python reference."""
+    path = Path(path)
     if steps is None:
         steps = min(len(np.asarray(data[p.name])) for p in fsm.inp_signals)
     data = {k: np.asarray(v, dtype=np.float64) for k, v in data.items()}
     ref_emu = FSMEmu(fsm)
     ref_emu.soft_reset()
     ref = _fsmemu_step_run(ref_emu, data, steps)
-    emu = FSMProject(fsm, path, prj_name=prj_name)
+    emu = FSMProject(fsm, path, prj_name=prj_name, flavor=flavor)
     emu.compile(nproc=1)
     emu.soft_reset()
     got = emu.run(data, steps=steps, scheduled=False)
@@ -100,14 +114,13 @@ def _mac_fsm():
     return FSM({'mac': comb}, conns)
 
 
-def test_mac_accumulator(temp_directory):
-    _require_verilator()
+def test_mac_accumulator(temp_directory, rtl_flavor):
     rng = np.random.default_rng(1)
     n = 24
     a = rng.integers(0, 16, n).astype(np.float64)
     b = rng.integers(0, 16, n).astype(np.float64)
     fsm = _mac_fsm()
-    ref, got = _run_both(fsm, {'a': a, 'b': b}, 'mac_top', Path(temp_directory) / 'mac')
+    ref, got = _run_both(fsm, {'a': a, 'b': b}, 'mac_top', Path(temp_directory) / rtl_flavor / 'mac', rtl_flavor)
     np.testing.assert_array_equal(got['y'], ref['y'])
     np.testing.assert_array_equal(got['y'][:, 0], np.cumsum(a * b))  # no overflow at these magnitudes
 
@@ -130,13 +143,12 @@ def _fir_fsm(coeffs):
     return FSM({'fir': comb}, tuple(conns))
 
 
-def test_fir_filter(temp_directory):
-    _require_verilator()
+def test_fir_filter(temp_directory, rtl_flavor):
     coeffs = [0.5, 0.25, 0.125]  # exactly representable with 4 fractional bits
     fsm = _fir_fsm(coeffs)
     rng = np.random.default_rng(2)
     x = rng.integers(-128, 128, 30).astype(np.float64)
-    ref, got = _run_both(fsm, {'x': x}, 'fir_top', Path(temp_directory) / 'fir')
+    ref, got = _run_both(fsm, {'x': x}, 'fir_top', Path(temp_directory) / rtl_flavor / 'fir', rtl_flavor)
     np.testing.assert_array_equal(got['y'], ref['y'])
 
     # NumPy reference: y[n] = sum_i coeff[i] * x[n-i] (exact at these coefficients/inputs).
@@ -165,13 +177,12 @@ def _iir_fsm(a=0.5, b=0.5):
     return FSM({'iir': comb}, conns)
 
 
-def test_iir_filter(temp_directory):
-    _require_verilator()
+def test_iir_filter(temp_directory, rtl_flavor):
     fsm = _iir_fsm(a=0.5, b=0.5)
     # Impulse then zeros: y = 0.5, 0.25, 0.125, 0.0625, 0, ... (truncates below the 1/16 grid).
     x = np.zeros(8, dtype=np.float64)
     x[0] = 1.0
-    ref, got = _run_both(fsm, {'x': x}, 'iir_top', Path(temp_directory) / 'iir')
+    ref, got = _run_both(fsm, {'x': x}, 'iir_top', Path(temp_directory) / rtl_flavor / 'iir', rtl_flavor)
     np.testing.assert_array_equal(got['y'], ref['y'])
     np.testing.assert_array_equal(got['y'][:, 0], np.array([0.5, 0.25, 0.125, 0.0625, 0.0, 0.0, 0.0, 0.0]))
 
@@ -197,13 +208,12 @@ def _counter_fsm():
     return FSM({'inc': comb}, conns)
 
 
-def test_counter(temp_directory):
-    _require_verilator()
+def test_counter(temp_directory, rtl_flavor):
     fsm = _counter_fsm()
     # Count up past the 4-bit wrap, hold while disabled, then synchronous reset (active-high).
     rst = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0], dtype=np.float64)
     en = np.array([1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1], dtype=np.float64)
-    ref, got = _run_both(fsm, {'rst': rst, 'en': en}, 'cnt_top', Path(temp_directory) / 'cnt')
+    ref, got = _run_both(fsm, {'rst': rst, 'en': en}, 'cnt_top', Path(temp_directory) / rtl_flavor / 'cnt', rtl_flavor)
     np.testing.assert_array_equal(got['y'], ref['y'])
 
     expected, c = [], 0
@@ -254,8 +264,7 @@ def _fifo_fsm(w=8, depth=4):
     return FSM({'incw': inc, 'incr': inc}, conns)
 
 
-def test_sync_fifo(temp_directory):
-    _require_verilator()
+def test_sync_fifo(temp_directory, rtl_flavor):
     w, depth = 8, 4
     fsm = _fifo_fsm(w, depth)
     rng = np.random.default_rng(7)
@@ -266,7 +275,13 @@ def test_sync_fifo(temp_directory):
     rd_en = np.concatenate([np.zeros(depth), np.ones(depth)])
     din = np.concatenate([pushed, np.zeros(depth)])
 
-    ref, got = _run_both(fsm, {'wr_en': wr_en, 'rd_en': rd_en, 'din': din}, 'fifo_top', Path(temp_directory) / 'fifo')
+    ref, got = _run_both(
+        fsm,
+        {'wr_en': wr_en, 'rd_en': rd_en, 'din': din},
+        'fifo_top',
+        Path(temp_directory) / rtl_flavor / 'fifo',
+        rtl_flavor,
+    )
     # First-word-fall-through: mem[rptr] shows each stored word the cycle before its pop
     # completes, so the head walks the FIFO in push order over this window.
     np.testing.assert_array_equal(got['dout'], ref['dout'])
@@ -314,8 +329,7 @@ def _systolic2x2_fsm():
     return FSM(logic, tuple(conns))
 
 
-def test_systolic_2x2(temp_directory):
-    _require_verilator()
+def test_systolic_2x2(temp_directory, rtl_flavor):
     fsm = _systolic2x2_fsm()
     rng = np.random.default_rng(11)
     A = rng.integers(-8, 8, (2, 2)).astype(np.float64)
@@ -328,7 +342,7 @@ def test_systolic_2x2(temp_directory):
         'bc0': np.array([B[0, 0], B[1, 0], z, z, z, z]),
         'bc1': np.array([z, B[0, 1], B[1, 1], z, z, z]),
     }
-    ref, got = _run_both(fsm, data, 'sys_top', Path(temp_directory) / 'sys', steps=6)
+    ref, got = _run_both(fsm, data, 'sys_top', Path(temp_directory) / rtl_flavor / 'sys', rtl_flavor, steps=6)
     for ij in [(0, 0), (0, 1), (1, 0), (1, 1)]:
         np.testing.assert_array_equal(got[f'c{ij[0]}{ij[1]}'], ref[f'c{ij[0]}{ij[1]}'])
     c_emu = np.array([[got[f'c{i}{j}'][-1, 0] for j in range(2)] for i in range(2)])
@@ -346,7 +360,7 @@ def _pair_sum_scheduled_fsm():
     sin_toggle, sout_toggle = _comb_io_signals('toggle', toggle)
 
     inp = Signal('inp', True, ((1, 8, 0),), reg=False, schedule=ModuloSchedule((0,), 2), mode='r')
-    out = Signal('out', True, ((1, 9, 0),), reg=False, schedule=ModuloSchedule((0, 1), 2), mode='w')
+    y = Signal('y', True, ((1, 9, 0),), reg=False, schedule=ModuloSchedule((0, 1), 2), mode='w')
     acc = Signal('acc', False, ((1, 9, 0),), reg=True, mode='rw', rst_to=(0,))
     phase = Signal('phase', False, ((0, 1, 0),), reg=True, mode='rw', rst_to=(0,))
     conns = (
@@ -355,13 +369,12 @@ def _pair_sum_scheduled_fsm():
         Conn(sout_add, acc, enable_if=phase, alt_src=inp),
         Conn(phase, sin_toggle[0:1]),
         Conn(sout_toggle, phase),
-        Conn(acc, out),
+        Conn(acc, y),
     )
     return FSM({'add': add, 'toggle': toggle}, conns)
 
 
-def test_scheduled_run_pair_sum(temp_directory):
-    _require_verilator()
+def test_scheduled_run_pair_sum(temp_directory, rtl_flavor):
     fsm = _pair_sum_scheduled_fsm()
     data = {'inp': np.array([2, -3, 4, 5, -6, 7], dtype=np.float64)}
     expected = np.array([[-1], [9], [1]], dtype=np.float64)
@@ -369,11 +382,17 @@ def test_scheduled_run_pair_sum(temp_directory):
     ref = FSMEmu(fsm)
     ref.soft_reset()
     ref_out = ref.run(data, scheduled=True)
-    np.testing.assert_array_equal(ref_out['out'], expected)
+    np.testing.assert_array_equal(ref_out['y'], expected)
 
-    emu = FSMProject(fsm, Path(temp_directory) / 'scheduled_pair_sum', prj_name='pair_sched_top')
+    path = Path(temp_directory) / rtl_flavor / 'scheduled_pair_sum'
+    emu = FSMProject(
+        fsm,
+        path,
+        prj_name='pair_sched_top',
+        flavor=rtl_flavor,
+    )
     emu.compile(nproc=1)
     emu.soft_reset()
     got = emu.run(data, scheduled=True)
-    np.testing.assert_array_equal(got['out'], ref_out['out'])
-    np.testing.assert_array_equal(got['out'], expected)
+    np.testing.assert_array_equal(got['y'], ref_out['y'])
+    np.testing.assert_array_equal(got['y'], expected)

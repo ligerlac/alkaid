@@ -265,8 +265,8 @@ class Conn:
 def _comb_io_signals(name: str, comb: CombLogic) -> tuple[Signal, Signal]:
     prec_in = tuple(qint.kif for qint in comb.inp_qint)
     prec_out = tuple(qint.kif for qint in comb.out_qint)
-    sig_in = Signal(f'__{name}_in', False, prec_in, reg=False)
-    sig_out = Signal(f'__{name}_out', False, prec_out, reg=False)
+    sig_in = Signal(f'INTERNAL_{name}_inp', False, prec_in, reg=False)
+    sig_out = Signal(f'INTERNAL_{name}_outp', False, prec_out, reg=False)
     return sig_in, sig_out
 
 
@@ -308,8 +308,8 @@ def _remove_const_logic(logic: dict[str, CombLogic], conns: Sequence[Conn]) -> t
             continue
         rst_to = tuple(map(float, comb([], quantize=False)))
         precisions = tuple(qint.kif for qint in comb.out_qint)
-        const_signals[f'__{name}_out'] = Signal(
-            f'__{name}_const',
+        const_signals[f'INTERNAL_{name}_outp'] = Signal(
+            f'INTERNAL_{name}_const',
             exposed=False,
             precisions=precisions,
             rst_if=None,
@@ -487,10 +487,10 @@ class FSMEmu:
         self.buffers = {sig.name: Buffer(sig, dtype=np.float64) for sig in self.fsm.signals.values()}
 
     def _eval_buf(self, name: str):
-        if not (name.startswith('__') and name.endswith('_out')):
+        if not (name.startswith('INTERNAL_') and name.endswith('_outp')):
             return self.buffers[name]
-        base = name[2:-4]
-        sig_in_name = f'__{base}_in'
+        base = name.removeprefix('INTERNAL_').removesuffix('_outp')
+        sig_in_name = f'INTERNAL_{base}_inp'
         val_in = self.buffers[sig_in_name]
         if not val_in._changed:
             return self.buffers[name]

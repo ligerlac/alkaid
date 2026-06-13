@@ -8,13 +8,35 @@ LINKFLAGS = $(INCLUDES) $(WARNINGS)
 LIBNAME = lib$(VM_PREFIX)_fsm_$(STAMP).so
 N_JOBS ?= $(shell nproc)
 VERILATOR_FLAGS ?= -Wall
+SOURCE_TYPE ?= verilog
 TOP_MODULE ?= $(VM_PREFIX)
 VMOD_PREFIX ?= $(TOP_MODULE)
 VERILOG_SOURCES = $(wildcard ../src/static/*.v) $(wildcard ../src/*.v)
+VHDL_STATIC_SOURCES = $(wildcard ../src/static/*.vhd)
+VHDL_TOP_SOURCE = ../src/$(TOP_MODULE).vhd
+VHDL_FSM_SOURCE = ../src/$(TOP_MODULE:_wrapper=).vhd
+VHDL_COMB_SOURCES = $(filter-out $(VHDL_TOP_SOURCE) $(VHDL_FSM_SOURCE),$(wildcard ../src/*.vhd))
+VHDL_SYNTH_SOURCE = $(TOP_MODULE).v
 
-./obj_dir/libV$(VMOD_PREFIX).a ./obj_dir/libverilated.a ./obj_dir/V$(VMOD_PREFIX)__ALL.a: $(VERILOG_SOURCES)
+ifneq ($(filter $(SOURCE_TYPE),verilog vhdl),$(SOURCE_TYPE))
+$(error SOURCE_TYPE must be either 'verilog' or 'vhdl')
+endif
+
+ifeq ($(SOURCE_TYPE),vhdl)
+VERILATOR_SOURCES = $(VHDL_SYNTH_SOURCE)
+else
+VERILATOR_SOURCES = $(VERILOG_SOURCES)
+endif
+
+$(VHDL_SYNTH_SOURCE): $(VHDL_STATIC_SOURCES) $(VHDL_COMB_SOURCES) $(VHDL_FSM_SOURCE) $(VHDL_TOP_SOURCE)
+	mkdir -p obj_dir
 	cp ../src/memfiles/* ./ 2>/dev/null || true
-	verilator --cc -j $(N_JOBS) -build --top-module $(TOP_MODULE) --prefix V$(VMOD_PREFIX) $(VERILATOR_FLAGS) $(VERILOG_SOURCES) -CFLAGS "$(CFLAGS)" -I../src -I../src/static
+	ghdl -a --std=08 --workdir=obj_dir $(VHDL_STATIC_SOURCES) $(VHDL_COMB_SOURCES) $(VHDL_FSM_SOURCE) $(VHDL_TOP_SOURCE)
+	ghdl synth --std=08 --workdir=obj_dir --out=verilog $(TOP_MODULE) > $(VHDL_SYNTH_SOURCE)
+
+./obj_dir/libV$(VMOD_PREFIX).a ./obj_dir/libverilated.a ./obj_dir/V$(VMOD_PREFIX)__ALL.a: $(VERILATOR_SOURCES)
+	cp ../src/memfiles/* ./ 2>/dev/null || true
+	verilator --cc -j $(N_JOBS) -build --top-module $(TOP_MODULE) --prefix V$(VMOD_PREFIX) $(VERILATOR_FLAGS) $(VERILATOR_SOURCES) -CFLAGS "$(CFLAGS)" -I../src -I../src/static
 
 $(LIBNAME): ./obj_dir/libV$(VMOD_PREFIX).a ./obj_dir/libverilated.a ./obj_dir/V$(VMOD_PREFIX)__ALL.a fsm_binder.cc fsm_config.hh fsm_wrapper.hh ioutil.hh
 	$(CXX) $(CFLAGS) $(LINKFLAGS) $(CXXFLAGS2) -pthread -shared -o $(LIBNAME) fsm_binder.cc ./obj_dir/libV$(VMOD_PREFIX).a ./obj_dir/libverilated.a ./obj_dir/V$(VMOD_PREFIX)__ALL.a $(EXTRA_CXXFLAGS)
@@ -28,3 +50,4 @@ slow: $(LIBNAME)
 clean:
 	rm -rf obj_dir
 	rm -f $(LIBNAME)
+	rm -f $(VHDL_SYNTH_SOURCE)

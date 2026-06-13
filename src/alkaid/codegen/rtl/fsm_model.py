@@ -15,7 +15,6 @@ from ...stateful import FSM, Signal
 from ...types import Precision
 from .rtl_model import at_path, canon_name, run_make_build, verilator_warn_suppression
 from .verilog.comb import table_mem_gen
-from .verilog.fsm import fsm_logic_gen, generate_io_wrapper
 
 P_I64 = ctypes.POINTER(ctypes.c_int64)
 P_F64 = ctypes.POINTER(ctypes.c_double)
@@ -162,9 +161,12 @@ class FSMProject:
         fsm: FSM,
         path: str | Path,
         prj_name: str | None = None,
+        flavor: str = 'verilog',
         print_latency: bool = False,
     ):
         self.fsm = fsm
+        self._flavor = flavor.lower()
+        assert self._flavor in ('vhdl', 'verilog'), f'Unsupported flavor {flavor}, only vhdl and verilog are supported.'
         self._path = Path(path).resolve()
         self._prj_name = prj_name or canon_name(self._path.stem)
         self._print_latency = print_latency
@@ -179,6 +181,13 @@ class FSMProject:
         (self._path / 'sim').mkdir(parents=True, exist_ok=True)
         (self._path / 'model').mkdir(parents=True, exist_ok=True)
 
+        flavor = self._flavor
+        suffix = 'v' if flavor == 'verilog' else 'vhd'
+        if flavor == 'vhdl':
+            from .vhdl.fsm import fsm_logic_gen, generate_io_wrapper
+        else:
+            from .verilog.fsm import fsm_logic_gen, generate_io_wrapper
+
         codes = fsm_logic_gen(
             self.fsm,
             self._prj_name,
@@ -188,7 +197,7 @@ class FSMProject:
         )
         codes[f'{self._prj_name}_wrapper'] = generate_io_wrapper(self.fsm, self._prj_name)
         for name, code in codes.items():
-            with open(self._path / f'src/{name}.v', 'w') as f:
+            with open(self._path / f'src/{name}.{suffix}', 'w') as f:
                 f.write(code)
 
         memfiles: dict[str, str] = {}
@@ -198,7 +207,7 @@ class FSMProject:
             with open(self._path / 'src/memfiles' / name, 'w') as f:
                 f.write(mem)
 
-        for path in self.__src_root.glob('verilog/source/*.v'):
+        for path in self.__src_root.glob(f'{flavor}/source/*.{suffix}'):
             shutil.copy(path, self._path / 'src/static')
 
         with open(self._path / 'sim/fsm_config.hh', 'w') as f:
@@ -212,7 +221,7 @@ class FSMProject:
         self.fsm.save(self._path / 'model/fsm.json.gz')
 
         _metadata = {
-            'flavor': 'verilog',
+            'flavor': self._flavor,
             'top_module': self._prj_name,
             'signal_count': len(self._signals),
         }
@@ -233,9 +242,13 @@ class FSMProject:
         env = os.environ.copy()
         env['VM_PREFIX'] = self._prj_name
         env['TOP_MODULE'] = f'{self._prj_name}_wrapper'
+        env['SOURCE_TYPE'] = self._flavor
         env['STAMP'] = self._uuid
         env['EXTRA_CXXFLAGS'] = '-fopenmp' if openmp else ''
-        env['VERILATOR_FLAGS'] = f'-Wall {verilator_warn_suppression()}'.strip()
+        if self._flavor == 'verilog':
+            env['VERILATOR_FLAGS'] = f'-Wall {verilator_warn_suppression()}'.strip()
+        else:
+            env['VERILATOR_FLAGS'] = verilator_warn_suppression()
         if nproc is not None:
             env['N_JOBS'] = str(nproc)
 

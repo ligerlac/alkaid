@@ -169,7 +169,9 @@ def fsm_logic_gen(
 
     # comb logic
 
-    comb_ops = [f'{name} _inst_{name} (.model_inp(__{name}_in), .model_out(__{name}_out));' for name in fsm.logic.keys()]
+    comb_ops = [
+        f'{name} _inst_{name} (.model_inp(INTERNAL_{name}_inp), .model_out(INTERNAL_{name}_outp));' for name in fsm.logic.keys()
+    ]
 
     # connections
 
