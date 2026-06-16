@@ -687,12 +687,12 @@ _functional(operator.mod, torch.remainder)(lambda a, b: a % b)
 _functional(operator.matmul)(lambda a, b: _einsum('...ij,...jk->...ik', a, b))
 _functional(operator.neg)(lambda x: -x)
 _functional(operator.pos)(lambda x: +x)
-_functional(operator.and_, torch.bitwise_and)(lambda a, b: a & b)
-_functional(operator.or_, torch.bitwise_or)(lambda a, b: a | b)
-_functional(operator.xor, torch.bitwise_xor)(lambda a, b: a ^ b)
+_functional(operator.and_, torch.bitwise_and, torch.ops.aten.bitwise_and.Tensor)(lambda a, b: a & b)
+_functional(operator.or_, torch.bitwise_or, torch.ops.aten.bitwise_or.Tensor)(lambda a, b: a | b)
+_functional(operator.xor, torch.bitwise_xor, torch.ops.aten.bitwise_xor.Tensor)(lambda a, b: a ^ b)
 
 
-@_functional(operator.invert, torch.bitwise_not)
+@_functional(operator.invert, torch.bitwise_not, torch.ops.aten.bitwise_not.Tensor)
 def _bitwise_not(x: FVArray):
     k, i, f = x.kif
     assert np.all(k == 0) and np.all(i == 1) and np.all(f == 0), 'only boolean-like bitwise_not is supported'
@@ -816,3 +816,13 @@ def _replay_getattr(obj, name: str):
 
 
 _functional_map[getattr] = _replay_getattr
+
+
+# aten.select.int(tensor, dim, index) — equivalent to tensor.select(dim, index)
+# e.g. x[:, 0] with dim=1, index=0 → strips that dimension
+@_functional(torch.ops.aten.select.int)
+def _aten_select(x: FVArray, dim: int, index: int) -> FVArray:
+    ndim = x.ndim
+    dim = dim % ndim
+    idx = (slice(None),) * dim + (index,)
+    return x[idx]

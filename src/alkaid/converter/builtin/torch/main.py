@@ -2,7 +2,8 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 import torch
-from torch.fx import Node, Tracer
+from torch.fx import Node
+from torch.fx.experimental.proxy_tensor import make_fx
 
 from alkaid.converter._plugin_loader import maybe_load_for
 from alkaid.converter.plugin import ALIRTracerPluginBase
@@ -11,13 +12,6 @@ from alkaid.trace import FVArray
 from .layers import _functional_map, _method_map, _modules_map, torch_numpy_unary_map
 
 
-class GraphTracer(Tracer):
-    def is_leaf_module(self, m: torch.nn.Module, module_qualified_name: str):
-        if type(m) not in _modules_map:
-            maybe_load_for(m, 'torch', lax=True)
-        if type(m) in _modules_map:
-            return True
-        return super().is_leaf_module(m, module_qualified_name)
 
 
 class MaybeRename:
@@ -89,8 +83,10 @@ class TorchALIRTracer(ALIRTracerPluginBase):
         if isinstance(inputs, FVArray):
             inputs = (inputs,)
         self.model: torch.nn.Module
-        graph = GraphTracer().trace(self.model)
-        modules = dict(self.model.named_modules())
+        dummy_inputs = tuple(torch.zeros(inp.shape, dtype=torch.bool) for inp in inputs)
+        gm = make_fx(self.model)(*dummy_inputs)
+        graph = gm.graph
+        modules = dict(gm.named_modules())
         inp_nodes = [n for n in graph.nodes if n.op == 'placeholder']
         out_nodes = [n for n in graph.nodes if n.op == 'output']
         assert len(out_nodes) == 1, f'only one output node is supported, but found {len(out_nodes)}'
@@ -147,7 +143,7 @@ class TorchALIRTracer(ALIRTracerPluginBase):
                         trace[f'{name}/final'] = (result,)
                 case 'get_attr':
                     target: str = node.target  # type: ignore
-                    env[node.name] = _resolve_attr(self.model, target)
+                    env[node.name] = _resolve_attr(gm, target)
                 case _:
                     raise NotImplementedError(f'unknown node op: {node.op}')
 
