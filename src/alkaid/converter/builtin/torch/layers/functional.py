@@ -692,10 +692,8 @@ _functional(operator.or_, torch.bitwise_or, torch.ops.aten.bitwise_or.Tensor)(la
 _functional(operator.xor, torch.bitwise_xor, torch.ops.aten.bitwise_xor.Tensor)(lambda a, b: a ^ b)
 
 
-@_functional(operator.invert, torch.bitwise_not, torch.ops.aten.bitwise_not.Tensor)
+@_functional(operator.invert, torch.bitwise_not, torch.ops.aten.bitwise_not.default)
 def _bitwise_not(x: FVArray):
-    k, i, f = x.kif
-    assert np.all(k == 0) and np.all(i == 1) and np.all(f == 0), 'only boolean-like bitwise_not is supported'
     return ~x
 
 
@@ -826,3 +824,58 @@ def _aten_select(x: FVArray, dim: int, index: int) -> FVArray:
     dim = dim % ndim
     idx = (slice(None),) * dim + (index,)
     return x[idx]
+
+
+# ---------------------------------------------------------------------------
+# ATen ops produced by make_fx for torchlogix models
+# ---------------------------------------------------------------------------
+
+# Concrete tensor equality (lut_ids == lut_id mask) — result is NOT an FVArray
+_functional_map[torch.ops.aten.eq.Scalar] = lambda t, s: t == s
+
+
+@_functional(torch.ops.aten.index.Tensor)
+def _aten_index(a: FVArray, indices) -> FVArray:
+    np_idx = tuple(
+        slice(None) if idx is None else to_np_arr(idx)
+        for idx in indices
+    )
+    return a[np_idx]
+
+
+@_functional(torch.ops.aten.empty_like.default)
+def _aten_empty_like(a: FVArray, **kwargs) -> FVArray:
+    return FVArray(np.zeros(a.shape), a.solver_options, hwconf=a.hwconf)
+
+
+@_functional(torch.ops.aten.view.default)
+def _aten_view(a: FVArray, shape) -> FVArray:
+    return a.reshape(shape if shape else ())
+
+
+def _aten_index_put_(a, indices, values, accumulate=False):
+    np_idx = tuple(
+        slice(None) if idx is None else to_np_arr(idx)
+        for idx in indices
+    )
+    a[np_idx] = values
+    return a
+
+
+_functional_map[torch.ops.aten.index_put_.default] = _aten_index_put_
+
+
+@_functional(torch.ops.aten.zeros_like.default)
+def _aten_zeros_like(a: FVArray, **kwargs) -> FVArray:
+    return FVArray(np.zeros(a.shape), a.solver_options, hwconf=a.hwconf)
+
+
+@_functional(torch.ops.aten.ones_like.default)
+def _aten_ones_like(a: FVArray, **kwargs) -> FVArray:
+    return FVArray(np.ones(a.shape), a.solver_options, hwconf=a.hwconf)
+
+
+@_functional(torch.ops.aten.sum.dim_IntList)
+def _aten_sum_dim(a: FVArray, dims, keepdim=False, **kwargs) -> FVArray:
+    axis = tuple(d % a.ndim for d in dims)
+    return np.sum(a, axis=axis[0] if len(axis) == 1 else axis, keepdims=keepdim)
