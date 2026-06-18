@@ -5,7 +5,7 @@ import numpy as np
 from ..._binary import iceil_log2, overlap_counts
 from ...trace import HWConfig
 from ...trace.fixed_variable import LookupTable
-from ...types import CombLogic, Op, QInterval
+from ...types import CombLogic, Op, QInterval, _iter_sum_terms
 from .cse import is_used_in
 
 
@@ -44,14 +44,27 @@ def _is_const_descendent(idx: int, ops: list[Op], cache: dict[int, float]) -> fl
     return 0.0
 
 
-def cost_lat_add(qint0: QInterval, qint1: QInterval, shift1: int, n_add: int, n_accum: int):
+def _bit_high(qint: QInterval) -> int:
+    signed, integers, _fractional = qint.kif
+    return int(signed) + integers - 1
+
+
+def _bit_low(qint: QInterval) -> int:
+    return -qint.kif.fractional
+
+
+def cost_lat_add(qint0: QInterval, qint1: QInterval, shift1: int, n_add: int, n_accum: int, is_sub: bool = False):
     left, overlap, right = overlap_counts(qint0, qint1, shift1)
     if overlap <= 0:  # bit concat
         return 0, 0
 
-    bw_add = left + overlap + right
-    cost = (max(bw_add - 1, 1) + n_add - 1) // n_add
-    lat = (bw_add - 1 + n_accum - 1) // n_accum * 0.025390625 + 1.09375
+    if is_sub:
+        cost = max(left + overlap + right - 1, 1)
+    else:
+        cost = left + overlap
+    # bw_add = left + overlap
+    # cost = (max(bw_add - 1, 1) + n_add - 1) // n_add
+    lat = (cost - 1 + n_accum - 1) // n_accum * 0.025390625 + 1.09375
     return cost, lat
 
 
@@ -65,7 +78,7 @@ def cost_lat_mul(qint0: QInterval, qint1: QInterval, n_add: int, n_accum: int):
     lat1 = b0 * ((b1 - 1 + n_accum - 1) // n_accum) * 0.025390625 + 1.09375
     lat2 = b1 * ((b0 - 1 + n_accum - 1) // n_accum) * 0.025390625 + 1.09375
     lat = min(lat1, lat2)
-    return cost, lat
+    return cost * 0.75, lat
 
 
 def _count_luts_rec(bit_nd: np.ndarray, LUT_X: int = 6) -> float:
@@ -112,13 +125,19 @@ def _count_luts(bit_nd: np.ndarray, LUT_X: int = 6) -> float:
 def cost_lat_lut(qint_in: QInterval, table: LookupTable, LUT_X: int, LUT_Y: int, skip_cost: bool = False):
 
     bw_in = sum(qint_in.kif)
-    lat = max(bw_in - LUT_X, 1) * 0.5
+    large_lut = bw_in - LUT_X > 6
+    if large_lut:
+        lat = max(bw_in - LUT_X, 1) * 0.5
+    else:
+        lut_extra_bits = max(bw_in - LUT_X, 0)
+        # Base + F7/8/9 + fabric
+        lat = 0.075 + 0.2 * min(lut_extra_bits, 3) + 0.8 * max(lut_extra_bits - 3, 0)
 
     if skip_cost:
         return 0, lat
 
-    if bw_in - LUT_X > 6:
-        return 0.7 * 2.0 ** (bw_in - LUT_X), lat
+    if large_lut:
+        return 0.5 * 2.0 ** (bw_in - LUT_X), lat
 
     out_bw = sum(table.spec.out_kif)
     data = table.padded_table(qint_in)
@@ -133,25 +152,78 @@ def cost_lat_lut(qint_in: QInterval, table: LookupTable, LUT_X: int, LUT_Y: int,
 
         bit_nd = bit_vals.reshape((2,) * bw_in)
         total_cost += _count_luts(bit_nd, LUT_X)
+    total_cost *= max(1.0 + (0.5625 - 0.109375 * out_bw), 1)
 
-    return ceil(total_cost), lat
+    return total_cost, lat
 
 
 def cost_lat_mux(qint0: QInterval, qint1: QInterval, shift1: int, LUT_X: int, LUT_Y: int):
-    return sum(overlap_counts(qint0, qint1, shift1)) * 2.0 ** (LUT_Y - LUT_X), 1
+    return sum(overlap_counts(qint0, qint1, shift1)) * 2.0 ** (LUT_Y - LUT_X), 0.5
 
 
-def cost_relu(qint: QInterval, LUT_X: int = 6, LUT_Y: int = 5):
-    # LUT6_2 fractures, but somehow 1/3 of the bits can't be shared statistically...
-    return sum(qint.kif) * 0.666, 0
+def cost_relu(qint_out: QInterval, LUT_X: int = 6, LUT_Y: int = 5):
+    return sum(qint_out.kif) * 0.5, 0
 
 
 def cost_lat_bin_bitops(qint0: QInterval, qint1: QInterval, shift1: int, LUT_X: int, LUT_Y: int):
     x, y, z = overlap_counts(qint0, qint1, shift1)
     if y <= 0:
         return 0, 0
-    cost = 2 * y / LUT_Y * 2 ** (LUT_Y - LUT_X)
+    cost = 3 * y / LUT_Y * 2 ** (LUT_Y - LUT_X)
     lat = 0.5
+    return cost, lat
+
+
+def cost_cadd(qint_out: QInterval, value: int, fractional: int):
+    value = abs(value)
+    if value == 0:
+        return 0
+    trailing_zeros = (value & -value).bit_length() - 1
+    const_low = trailing_zeros - fractional
+    carry_start = max(_bit_low(qint_out), const_low)
+    carry_span = max(_bit_high(qint_out) - carry_start + 1, 0)
+    return max(carry_span - 1, 0) * 0.15
+
+
+def _ternary_add_suffix_width(idx: int, ops: list[Op]) -> int:
+    op = ops[idx]
+    raw_terms = tuple((addr, 1 if plus else -1, shift) for addr, plus, shift in _iter_sum_terms(op))
+    kifs = [ops[addr].qint.kif for addr, _, _ in raw_terms]
+    term_fracs = [kif.fractional - shift for kif, (_, _, shift) in zip(kifs, raw_terms)]
+    align_f = max(term_fracs)
+    drop_lsbs = align_f - op.qint.kif.fractional
+    out_width = sum(op.qint.kif)
+    out_high = drop_lsbs + out_width - 1
+    pads = [align_f - term_frac for term_frac in term_fracs]
+    negates = [sign < 0 for _, sign, _ in raw_terms]
+
+    min_pad = min(pads)
+    low_count = sum(pad == min_pad for pad in pads)
+    low_input = pads.index(min_pad)
+    no_next_pad = out_high + 2
+    next_pads = [pad if pad > min_pad else no_next_pad for pad in pads]
+    upper_start = min(next_pads)
+    low_copy_lo = max(drop_lsbs, min_pad)
+    low_copy_hi = min(out_high, upper_start - 1)
+
+    lowcopy = (
+        low_count == 1
+        and not negates[low_input]
+        and upper_start != no_next_pad
+        and upper_start > drop_lsbs
+        and low_copy_hi >= low_copy_lo
+    )
+    if not lowcopy:
+        return out_width
+    return max(out_high - upper_start + 1, 0)
+
+
+def cost_lat_ternary_add(idx: int, ops: list[Op], n_accum: int):
+    suffix_width = _ternary_add_suffix_width(idx, ops)
+    if suffix_width <= 0:
+        return 0, 0
+    cost = suffix_width + ceil(suffix_width / 8)
+    lat = ((suffix_width - 1 + n_accum - 1) // n_accum * 0.03125 + 1.0) * 1.3125
     return cost, lat
 
 
@@ -175,39 +247,25 @@ def cost_lat_op(
             op0, op1 = ops[op.addr[0]], ops[op.addr[1]]
             qint0, qint1 = op0.qint, op1.qint
             shift1 = op.data[0]
-            c, l = cost_lat_add(qint0, qint1, shift1, n_add, n_carry)
-        case 11:
-            c, l = 0, 0
-            shift0 = op.data[1]
-            if len(op.addr) > 3:
-                for j in range(1, len(op.addr)):
-                    ci, li = cost_lat_add(ops[op.addr[0]].qint, ops[op.addr[j]].qint, op.data[2 * j + 1] - shift0, n_add, n_carry)
-                    c += ci
-                    l += li
-            else:
-                assert len(op.addr) == 3
-                c1, l1 = cost_lat_add(ops[op.addr[0]].qint, ops[op.addr[1]].qint, op.data[3] - shift0, n_add, n_carry)
-                c2, l2 = cost_lat_add(ops[op.addr[0]].qint, ops[op.addr[2]].qint, op.data[5] - shift0, n_add, n_carry)
-                c, l = max(c1, c2), max(l1, l2)
+            c, l = cost_lat_add(qint0, qint1, shift1, n_add, n_carry, op.opcode == 1)
         case 2:  # relu(-)
             qint_in = ops[op.addr[0]].qint
             if qint_in.min >= 0:
                 return 0, 0  # no-op for non-negative
-            c, l = cost_relu(qint_in, LUT_X, LUT_Y)
+            c, l = cost_relu(op.qint, LUT_X, LUT_Y)
         case 3:  # WRAP
             return 0, 0
         case 4:  # cadd: absorbed if consumer is not add/sub/mux
             eff_consumers = _cadd_consumer_width(idx, ops, used_in)
             if any(cop in (0, 1, 6) for cop in eff_consumers):
-                bw_in = sum(ops[op.addr[0]].qint.kif)
-                return max(bw_in - 1, 0) * 0.30, 0
+                return cost_cadd(op.qint, op.data[0], op.data[1]), 0
             return 0, 0
         case 5:  # const
             return 0, 0
         case 6:  # msb_mux
             out_bw = sum(op.qint.kif)
             sf = _is_const_descendent(idx, ops, _cache)
-            return out_bw * (0.5 - 0.36 * sf), 1.0
+            return out_bw * (0.5 - 0.36 * sf), 0.5
         case 7:  # mul
             qint0, qint1 = ops[op.addr[0]].qint, ops[op.addr[1]].qint
             c, l = cost_lat_mul(qint0, qint1, n_add, n_carry)
@@ -222,6 +280,8 @@ def cost_lat_op(
             qint0, qint1 = ops[op.addr[0]].qint, ops[op.addr[1]].qint
             shift = op.data[0]
             c, l = cost_lat_bin_bitops(qint0, qint1, shift, LUT_X, LUT_Y)
+        case 11:  # accum
+            c, l = cost_lat_ternary_add(idx, ops, n_carry)
         case _:
             raise NotImplementedError(f'Unsupported opcode: {op.opcode}')
     return c, l

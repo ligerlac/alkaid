@@ -11,14 +11,9 @@ class _Score(tuple[int, int, int, int, int]):
         return _Score(x - y for x, y in zip(self, other))
 
 
-def _width(op: Op) -> int:
-    signed, integers, fractional = op.qint.kif
-    return int(signed) + int(integers) + int(fractional)
-
-
 def _edge_score(ops: list[Op], _root_idx: int, child_idx: int) -> _Score:
-    child_inp_ws = [_width(ops[idx]) for idx in ops[child_idx].addr]
-    ret = (1, _width(ops[child_idx]), max(child_inp_ws), sum(child_inp_ws), -child_idx)
+    child_inp_ws = [sum(ops[idx].qint.kif) for idx in ops[child_idx].addr]
+    ret = (1, sum(ops[child_idx].qint.kif), max(child_inp_ws), sum(child_inp_ws), -child_idx)
     return _Score(ret)
 
 
@@ -116,7 +111,12 @@ def fuse_ternary_adders(comb: CombLogic) -> CombLogic:
         terms = _to_ternary_terms(comb.ops, root_idx, child_idx)
         addr = tuple(idx for idx, _, _ in terms)
         data = tuple(value for _, sign, shift in terms for value in (1 if sign > 0 else 0, shift))
-        ops[root_idx] = Op(addr, 11, data, root.qint, root.latency, root.cost)
+        kif0, kif1, kif2 = ops[addr[0]].qint.kif, ops[addr[1]].qint.kif, ops[addr[2]].qint.kif
+        sh0, sh1, sh2 = data[1], data[3], data[5]
+        _max = max(sum(kif0[:2]) + sh0, sum(kif1[:2]) + sh1, sum(kif2[:2]) + sh2)
+        _min = max(kif0[2] - sh0, kif1[2] - sh1, kif2[2] - sh2)
+        cost = _max + _min
+        ops[root_idx] = Op(addr, 11, data, root.qint, root.latency, cost)
 
     return CombLogic(
         comb.shape,
