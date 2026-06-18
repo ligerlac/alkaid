@@ -1,4 +1,5 @@
 from ...types import CombLogic, Op
+from .surrogate import add_surrogate, cost_lat_ternary_add
 
 
 # (#fused adders, root width, widest child input, total child input width, -child idx)
@@ -111,14 +112,12 @@ def fuse_ternary_adders(comb: CombLogic) -> CombLogic:
         terms = _to_ternary_terms(comb.ops, root_idx, child_idx)
         addr = tuple(idx for idx, _, _ in terms)
         data = tuple(value for _, sign, shift in terms for value in (1 if sign > 0 else 0, shift))
-        kif0, kif1, kif2 = ops[addr[0]].qint.kif, ops[addr[1]].qint.kif, ops[addr[2]].qint.kif
-        sh0, sh1, sh2 = data[1], data[3], data[5]
-        _max = max(sum(kif0[:2]) + sh0, sum(kif1[:2]) + sh1, sum(kif2[:2]) + sh2)
-        _min = max(kif0[2] - sh0, kif1[2] - sh1, kif2[2] - sh2)
-        cost = _max + _min
-        ops[root_idx] = Op(addr, 11, data, root.qint, root.latency, cost)
+        ops[root_idx] = Op(addr, 11, data, root.qint, root.latency, root.cost)
+        c, l = cost_lat_ternary_add(root_idx, ops, comb.carry_size % 65535)
+        _base_lat = max(ops[i].latency for i in addr)
+        ops[root_idx] = Op(addr, 11, data, root.qint, _base_lat + l, c)
 
-    return CombLogic(
+    comb = CombLogic(
         comb.shape,
         comb.inp_shifts,
         comb.out_idxs,
@@ -129,3 +128,4 @@ def fuse_ternary_adders(comb: CombLogic) -> CombLogic:
         comb.adder_size,
         comb.lookup_tables,
     )
+    return add_surrogate(comb, _skip_op8_cost=True)

@@ -233,6 +233,7 @@ def cost_lat_op(
     hwconf: HWConfig,
     lut: tuple[LookupTable, ...] | None,
     used_in: dict[int, set[int]],
+    _skip_op8_cost: bool = False,
 ) -> tuple[float, float]:
     LUT_X, LUT_Y = 6, 5
     n_add, n_carry = hwconf.adder_size % 65535, hwconf.carry_size % 65535
@@ -273,7 +274,7 @@ def cost_lat_op(
             qint_in = ops[op.addr[0]].qint
             # qint_out = op.qint
             assert lut is not None
-            c, l = cost_lat_lut(qint_in, lut[op.data[0]], LUT_X, LUT_Y)
+            c, l = cost_lat_lut(qint_in, lut[op.data[0]], LUT_X, LUT_Y, skip_cost=_skip_op8_cost)
         case 9:  # unary bitops: absorbed
             c, l = 0, 0
         case 10:  # bin bitops
@@ -291,14 +292,14 @@ def _with_cost_lat(op: Op, cost, lat) -> Op:
     return Op(op.addr, op.opcode, op.data, op.qint, lat, cost)
 
 
-def add_surrogate(comb: CombLogic) -> CombLogic:
+def add_surrogate(comb: CombLogic, _skip_op8_cost=False) -> CombLogic:
     "Add surrogate cost and latency"
     new_ops = []
     ops = comb.ops
     hwconf = HWConfig(comb.adder_size, comb.carry_size, -1)
     used_in = is_used_in(comb)
     for idx, op in enumerate(comb.ops):
-        cost, lat = cost_lat_op(idx, ops, hwconf, comb.lookup_tables, used_in)
+        cost, lat = cost_lat_op(idx, ops, hwconf, comb.lookup_tables, used_in, _skip_op8_cost=_skip_op8_cost)
         lat = lat + max(tuple(new_ops[j].latency for j in op.input_ids) + (0,))
         new_ops.append(_with_cost_lat(op, cost, lat))
     return CombLogic(
