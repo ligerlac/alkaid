@@ -871,3 +871,8 @@ def _np_round(a: FVArray, decimals=0, **kw):
     _k, _i, _ = a.kif
     _i = np.maximum(_i + 1, 1)
     return a.quantize(_k, _i, 0, round_mode='RND_CONV')
+
+
+@_array_fn(np.empty, np.empty_like)
+def _allocate_without_initialization(*args, **kwargs):
+    raise NotImplementedError(f"Allocation without initialization is not supported")
