@@ -674,6 +674,21 @@ for _t, _np in [
     _functional(_t)(_np)
 
 
+# tensor creations
+
+for _t, _np in [
+    (torch.empty, np.empty),
+    (torch.zeros, np.zeros),
+    (torch.ones, np.ones),
+    (torch.full, np.full),
+    (torch.empty_like, np.empty_like),
+    (torch.zeros_like, np.zeros_like),
+    (torch.ones_like, np.ones_like),
+    (torch.full_like, np.full_like),
+]:
+    _functional(_t)(_np)
+
+
 # Use Python operators for arithmetic so RetardedFVArray (from .apply) dispatches
 # through its own __mul__/__add__/etc. Numpy ufuncs would bypass that and lose the
 # delayed lookup-table operation.
