@@ -35,7 +35,7 @@ def _makesure_ret_arr(fn: Callable) -> Callable:
     return wrapper
 
 
-_IGNORED_KWARGS = ('inplace', 'out', 'memory_format')
+_IGNORED_KWARGS = ('inplace', 'out', 'memory_format', 'dtype', 'device')
 
 
 def _strip_ignored_kwargs(fn: Callable) -> Callable:
@@ -821,6 +821,8 @@ def _replay_getattr(obj, name: str):
         return obj.shape
     if name == 'ndim':
         return obj.ndim
+    if name == 'dtype':
+        return obj.dtype
     # torch.max / torch.min / torch.sort return a namedtuple; our replay returns the
     # values tensor directly, so both accessors are identity.
     if name == 'values':
